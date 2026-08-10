@@ -162,7 +162,7 @@ git clone https://github.com/YOUR_USERNAME/palaeolithic-landscape-geoenvironment
 
 ### 2. Download data from Zenodo
 Download and extract the data archive from:
-[https://doi.org/PASTE_ZENODO_DOI_HERE](https://doi.org/10.5281/zenodo.21866544)
+[https://doi.org/10.5281/zenodo.21866544](https://doi.org/10.5281/zenodo.21866544)
 
 ### 3. Update file paths
 In `00_Environment_Setup.R`, update:
@@ -215,7 +215,7 @@ If you use these scripts, please cite:
 > Begade, S. (2026). R scripts for multi-source geoenvironmental
 > characterisation of Palaeolithic sites, Wainganga-Wardha Basin,
 > Central India [Software]. GitHub.
-> https://github.com/YOUR_USERNAME/palaeolithic-landscape-geoenvironmental-characterisation
+> https://github.com/sushantbegade/palaeolithic-landscape-geoenvironmental-characterisation
 > DOI: https://doi.org/10.5281/zenodo.21866496
 
 **Data:**
