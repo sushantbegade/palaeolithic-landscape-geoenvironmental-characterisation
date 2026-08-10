@@ -1,6 +1,6 @@
 # Reading the Palaeolithic Landscape: Multi-Source Geoenvironmental Characterisation
 
-[![DOI](https://zenodo.org/badge/DOI/PASTE_ZENODO_DOI_HERE.svg)](https://doi.org/PASTE_ZENODO_DOI_HERE)
+[![DOI](https://zenodo.org/badge/DOI/PASTE_ZENODO_DOI_HERE.svg)](https://doi.org/10.5281/zenodo.21866496)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![R Version](https://img.shields.io/badge/R-%3E%3D4.5.0-blue)](https://www.r-project.org/)
 
@@ -162,7 +162,7 @@ git clone https://github.com/YOUR_USERNAME/palaeolithic-landscape-geoenvironment
 
 ### 2. Download data from Zenodo
 Download and extract the data archive from:
-[https://doi.org/PASTE_ZENODO_DOI_HERE](https://doi.org/PASTE_ZENODO_DOI_HERE)
+[https://doi.org/PASTE_ZENODO_DOI_HERE](https://doi.org/10.5281/zenodo.21866544)
 
 ### 3. Update file paths
 In `00_Environment_Setup.R`, update:
@@ -216,13 +216,13 @@ If you use these scripts, please cite:
 > characterisation of Palaeolithic sites, Wainganga-Wardha Basin,
 > Central India [Software]. GitHub.
 > https://github.com/YOUR_USERNAME/palaeolithic-landscape-geoenvironmental-characterisation
-> DOI: PASTE_ZENODO_DOI_HERE
+> DOI: https://doi.org/10.5281/zenodo.21866496
 
 **Data:**
 > Begade, S. (2026). Multi-source geoenvironmental dataset for
 > Palaeolithic landscape characterisation, Nagpur-Chandrapur Districts,
 > Central India [Dataset]. Zenodo.
-> DOI: PASTE_ZENODO_DOI_HERE
+> DOI: https://doi.org/10.5281/zenodo.21866544
 
 ---
 
