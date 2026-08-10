@@ -157,7 +157,7 @@ renv::restore()
 
 ### 1. Clone repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/palaeolithic-landscape-geoenvironmental-characterisation.git
+git clone https://github.com/sushantbegade/palaeolithic-landscape-geoenvironmental-characterisation.git
 ```
 
 ### 2. Download data from Zenodo
