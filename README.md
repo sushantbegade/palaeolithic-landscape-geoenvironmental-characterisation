@@ -228,11 +228,11 @@ If you use these scripts, please cite:
 
 ## Author
 
-**Sushant Begade**
-Ph.D. Research Scholar
+**Sushant Begade**,
+Ph.D. Research Scholar,
 Department of Ancient Indian History, Culture and Archaeology
 Rashtrasant Tukadoji Maharaj Nagpur University
-Nagpur, Maharashtra, India
+Nagpur, Maharashtra, India.
 ORCID: [0009-0003-0804-1763](https://orcid.org/0009-0003-0804-1763)
 
 ---
