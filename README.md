@@ -33,6 +33,7 @@ Basin, Vidarbha, Central India.
 
 ## Repository Structure
 
+```
 ├── 00_Environment_Setup.R # Package installation + project folder architecture
 ├── 01_Site_Data_Loading_Validation.R # Site data cleaning, validation, period classification
 ├── 02_Background_Point_Generation.R # Pseudo-absence background point generation (n=1000)
@@ -45,7 +46,7 @@ Basin, Vidarbha, Central India.
 ├── global_params.RData # Global parameters + file paths
 ├── renv.lock # Package version lockfile (reproducibility)
 └── README.md # This file
-
+```
 ---
 
 ## Data Sources
