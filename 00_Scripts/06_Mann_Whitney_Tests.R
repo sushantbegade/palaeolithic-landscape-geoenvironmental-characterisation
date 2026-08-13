@@ -1,40 +1,46 @@
 # =============================================================
-# SCRIPT 06: Mann-Whitney U Tests + Significance Matrix
+# SCRIPT 06 (REBUILT): Mann-Whitney U Tests + Significance Matrix
 # =============================================================
 # Project: Reading the Palaeolithic Landscape
 # Chapter: Mapping the Past (Springer Nature, 2026)
 # Author: Sushant Begade | RTMNU Nagpur
 # ORCID: 0009-0003-0804-1763
-# Date: August 2026
+# Rebuild date: August 2026
 # =============================================================
-# PURPOSE: Enhancement 3 — Period-specific significance matrix.
-# Run separate Mann-Whitney U tests per variable per cultural
-# period (LP, MP, UP) comparing site vs background locations.
-# Generate period × variable significance matrix.
-# Identify which environmental dimensions mattered in
-# LP vs MP vs UP.
-# All variables tested:
-# - Sentinel-2A bands + indices
-# - Soil properties
-# - DEM (elevation)
-# - Climate variables
-# - Structural geological proximity
-# - Burial depth (taphonomy)
+# CHANGES FROM ORIGINAL SCRIPT 06:
+#   1. analysis_vars REBUILT: burial_depth_m REMOVED (Script 05 found
+#      the borehole data is GSI mineral-exploration DDH data with
+#      <8% site coverage at any defensible interpolation distance —
+#      not usable as an analysis variable). 6 geochem major-oxide
+#      CLR-PCA variables ADDED (Script 04) — geochemistry now
+#      genuinely enters the statistical results for the first time.
+#      Net: 25 -> 30 analysis variables.
+#   2. CHELSA-LGM variables RETAINED but flagged explicitly at every
+#      relevant point as a spatially-structured covariate, NOT a
+#      period-matched palaeoclimate reconstruction (LP/MP predate the
+#      ~21ka TraCE21k window by >100ka). Script 07 will run RF with/
+#      without these variables as an explicit sensitivity check.
+#   3. NEW — Persistent Places analysis: MULTI-period sites (n=60,
+#      Script 01) compared against background on the same variable
+#      battery, reported separately from the LP/MP/UP period-
+#      stratified tests. Turns the 60 excluded multi-period sites
+#      into a positive finding (palimpsest/reoccupation locations)
+#      instead of a silent data loss.
+#   4. NEW — Spatial block bootstrap for the headline structural-
+#      geology result (dist_fault/dyke/lineament/shear, LP & MP,
+#      the chapter's strongest claim per the original draft). Standard
+#      MW+Bonferroni does not correct for spatial pseudoreplication
+#      (reviewer critical problem #2) — this provides a spatially-
+#      aware robustness check on the specific claims the Discussion
+#      leans on hardest, without rebuilding the entire inference
+#      framework as full spatial logistic/GAM modelling (deferred to
+#      Script 07 where RF spatial-block CV is implemented instead).
 # =============================================================
-
-
-# -------------------------------------------------------------
-# SECTION 1: Load Global Parameters + All Data
-# -------------------------------------------------------------
 
 load("E:/Projects & Researches/Nagpur-Chandrapur Enhanced Dataset/Reading_the_Palaeolithic_Landscape_Chapter/00_Scripts/global_params.RData")
-
-load(file.path(chapter_root,
-               "03_Extracted_Values/master_extraction_matrix.RData"))
-load(file.path(chapter_root,
-               "05_Structural_Geology/vector_extraction_matrix.RData"))
-load(file.path(chapter_root,
-               "06_Taphonomy/taphonomy_data.RData"))
+load(file.path(chapter_root, "03_Extracted_Values/master_extraction_matrix.RData"))
+load(file.path(chapter_root, "05_Structural_Geology/vector_extraction_matrix.RData"))
+load(file.path(chapter_root, "06_Taphonomy/taphonomy_data.RData"))
 
 library(tidyverse)
 library(rstatix)
@@ -46,10 +52,8 @@ library(patchwork)
 set.seed(rf_seed)
 
 message("All data loaded.")
-message("Master matrix: ", nrow(master_matrix), " rows × ",
-        ncol(master_matrix), " columns")
-message("Vector matrix: ", nrow(vector_matrix), " rows × ",
-        ncol(vector_matrix), " columns")
+message("Master matrix: ", nrow(master_matrix), " rows")
+message("Vector matrix (structural + geochem): ", nrow(vector_matrix), " rows")
 
 
 # -------------------------------------------------------------
@@ -58,586 +62,348 @@ message("Vector matrix: ", nrow(vector_matrix), " rows × ",
 
 message("\nAssembling full analysis matrix...")
 
-# Core variables from master matrix
 core_vars <- master_matrix %>%
   select(
-    point_id, point_type, period,
-    # DEM
+    point_id, point_type, period, coord_precision, bg_source,
     elevation,
-    # Sentinel-2A indices (primary — not raw bands)
     NDVI, NDWI, MNDWI, NDBI, BSI, SAVI, MSAVI,
-    # Soil properties
-    soil_depth, soil_erosion, soil_productivity,
-    soil_slope, soil_texture,
-    # CHELSA LGM palaeoclimate
+    soil_depth, soil_erosion, soil_productivity, soil_slope, soil_texture,
     chelsa_bio01_lgm, chelsa_bio12_lgm, chelsa_bio15_lgm,
-    # CHELSA modern
     chelsa_bio01_modern, chelsa_bio12_modern, chelsa_bio15_modern
   )
 
-# Structural geology from vector matrix
-struct_vars <- structural_matrix %>%
-  select(point_id, dist_fault, dist_dyke,
-         dist_lineament, dist_shear, dist_mineral)
+struct_vars <- vector_matrix %>%
+  select(point_id, dist_fault, dist_dyke, dist_lineament, dist_shear, dist_mineral)
 
-# Taphonomy
-taph_vars <- taphonomy_matrix %>%
-  select(point_id, burial_depth_m)
+geochem_vars <- vector_matrix %>%
+  select(point_id, starts_with("geochem_"))
 
-# Join all
+# burial_depth_m DELIBERATELY EXCLUDED — see Script 05 findings.
+# Retained here ONLY as a descriptive join for reporting coverage/
+# limitations in Methods/Discussion, NOT as an analysis_var.
+burial_descriptive <- taphonomy_matrix %>%
+  select(point_id, burial_depth_m, burial_risk_label)
+
 full_matrix <- core_vars %>%
   left_join(struct_vars, by = "point_id") %>%
-  left_join(taph_vars,   by = "point_id")
+  left_join(geochem_vars, by = "point_id") %>%
+  left_join(burial_descriptive, by = "point_id")
 
-message("Full analysis matrix: ", nrow(full_matrix),
-        " rows × ", ncol(full_matrix), " columns")
+message("Full analysis matrix: ", nrow(full_matrix), " rows x ", ncol(full_matrix), " cols")
 
-# Define analysis variables (exclude ID + metadata columns)
-analysis_vars <- names(full_matrix)[
-  !names(full_matrix) %in%
-    c("point_id", "point_type", "period")
-]
+analysis_vars <- setdiff(
+  names(full_matrix),
+  c("point_id", "point_type", "period", "coord_precision", "bg_source",
+    "burial_depth_m", "burial_risk_label")
+)
 
-message("Variables to test: ", length(analysis_vars))
+message("\nAnalysis variables (n=", length(analysis_vars), "):")
 message(paste(analysis_vars, collapse = ", "))
+message("\nburial_depth_m / burial_risk_label retained for DESCRIPTIVE reporting")
+message("only (Section 6.4 rewrite) — NOT included in analysis_vars.")
+message("\nCHELSA-LGM vars (chelsa_*_lgm) are spatially-structured covariates,")
+message("NOT period-matched palaeoclimate for LP/MP. Script 07 runs RF with/")
+message("without these as an explicit sensitivity check — flag now, resolve there.")
 
 
 # -------------------------------------------------------------
-# SECTION 3: Helper Function — Mann-Whitney U Test
+# SECTION 3: Mann-Whitney U Helper (unchanged logic)
 # -------------------------------------------------------------
 
-run_mw_test <- function(data, variable, period_filter) {
+run_mw_test <- function(data, variable, group_filter_type, period_filter = NULL) {
+  # group_filter_type: "period" (site period == period_filter vs background)
+  #                     "multi" (site period == MULTI vs background)
   
-  # Filter to period sites + all background
-  test_data <- data %>%
-    filter(point_type == "background" |
-             (point_type == "site" & period == period_filter)) %>%
-    mutate(group = ifelse(point_type == "site", "site", "background")) %>%
-    select(group, value = all_of(variable)) %>%
-    filter(!is.na(value))
-  
-  n_sites <- sum(test_data$group == "site")
-  n_bg    <- sum(test_data$group == "background")
-  
-  # Need minimum observations
-  if (n_sites < 3 || n_bg < 3) {
-    return(data.frame(
-      variable = variable,
-      period   = period_filter,
-      p_value  = NA,
-      w_stat   = NA,
-      median_site = NA,
-      median_bg   = NA,
-      direction   = NA,
-      significant = NA
-    ))
+  if (group_filter_type == "period") {
+    test_data <- data %>%
+      filter(point_type == "background" |
+               (point_type == "site" & period == period_filter)) %>%
+      mutate(group = ifelse(point_type == "site", "site", "background")) %>%
+      select(group, value = all_of(variable)) %>%
+      filter(!is.na(value))
+    label <- period_filter
+  } else {
+    test_data <- data %>%
+      filter(point_type == "background" |
+               (point_type == "site" & period == "MULTI")) %>%
+      mutate(group = ifelse(point_type == "site", "multi", "background")) %>%
+      select(group, value = all_of(variable)) %>%
+      filter(!is.na(value))
+    label <- "MULTI"
   }
   
-  # Run Wilcoxon rank-sum (Mann-Whitney U)
-  test_result <- tryCatch({
-    wilcox.test(
-      value ~ group,
-      data        = test_data,
-      exact       = FALSE,
-      correct     = TRUE,
-      alternative = "two.sided"
-    )
-  }, error = function(e) NULL)
+  n_site <- sum(test_data$group %in% c("site", "multi"))
+  n_bg   <- sum(test_data$group == "background")
   
+  if (n_site < 3 || n_bg < 3) {
+    return(data.frame(variable = variable, period = label, p_value = NA, w_stat = NA,
+                      median_site = NA, median_bg = NA, direction = NA,
+                      significant = NA, n_site = n_site, n_bg = n_bg))
+  }
+  
+  test_result <- tryCatch(
+    wilcox.test(value ~ group, data = test_data, exact = FALSE,
+                correct = TRUE, alternative = "two.sided"),
+    error = function(e) NULL
+  )
   if (is.null(test_result)) {
-    return(data.frame(
-      variable    = variable,
-      period      = period_filter,
-      p_value     = NA,
-      w_stat      = NA,
-      median_site = NA,
-      median_bg   = NA,
-      direction   = NA,
-      significant = NA
-    ))
+    return(data.frame(variable = variable, period = label, p_value = NA, w_stat = NA,
+                      median_site = NA, median_bg = NA, direction = NA,
+                      significant = NA, n_site = n_site, n_bg = n_bg))
   }
   
-  # Medians
-  med_site <- median(
-    test_data$value[test_data$group == "site"], na.rm = TRUE
-  )
-  med_bg <- median(
-    test_data$value[test_data$group == "background"], na.rm = TRUE
-  )
-  
-  # Direction
-  direction <- ifelse(med_site > med_bg, "higher_at_sites",
-                      "lower_at_sites")
+  med_site <- median(test_data$value[test_data$group %in% c("site","multi")], na.rm = TRUE)
+  med_bg   <- median(test_data$value[test_data$group == "background"], na.rm = TRUE)
+  direction <- ifelse(med_site > med_bg, "higher_at_sites", "lower_at_sites")
   
   data.frame(
-    variable    = variable,
-    period      = period_filter,
-    p_value     = round(test_result$p.value, 4),
-    w_stat      = round(test_result$statistic, 0),
-    median_site = round(med_site, 4),
-    median_bg   = round(med_bg, 4),
-    direction   = direction,
-    significant = test_result$p.value < alpha
+    variable = variable, period = label,
+    p_value = round(test_result$p.value, 4), w_stat = round(test_result$statistic, 0),
+    median_site = round(med_site, 4), median_bg = round(med_bg, 4),
+    direction = direction, significant = test_result$p.value < alpha,
+    n_site = n_site, n_bg = n_bg
   )
 }
 
 
 # -------------------------------------------------------------
-# SECTION 4: Run Mann-Whitney U — All Variables × All Periods
+# SECTION 4: Run MW — All Variables x LP/MP/UP  (unchanged approach)
 # -------------------------------------------------------------
 
-message("\nRunning Mann-Whitney U tests...")
-message("Variables: ", length(analysis_vars))
-message("Periods: ", paste(periods, collapse = ", "))
-message("Total tests: ", length(analysis_vars) * length(periods))
+message("\nRunning Mann-Whitney U tests: ", length(analysis_vars), " vars x ",
+        length(periods), " periods = ", length(analysis_vars) * length(periods), " tests")
 
 mw_results <- list()
-
 for (per in periods) {
-  message("\nPeriod: ", per)
   for (var in analysis_vars) {
-    result <- run_mw_test(full_matrix, var, per)
-    mw_results[[paste(per, var, sep = "_")]] <- result
+    mw_results[[paste(per, var, sep = "_")]] <- run_mw_test(full_matrix, var, "period", per)
   }
   message("  Done: ", per)
 }
-
-# Combine all results
 mw_table <- bind_rows(mw_results)
 
-message("\nMann-Whitney U tests complete.")
-message("Total tests run: ", nrow(mw_table))
-message("Significant results (p < ", alpha, "): ",
-        sum(mw_table$significant, na.rm = TRUE))
-
-
-# -------------------------------------------------------------
-# SECTION 5: Apply Bonferroni Correction
-# -------------------------------------------------------------
-
-message("\nApplying Bonferroni correction...")
-
 mw_table <- mw_table %>%
-  mutate(
-    p_bonferroni = p.adjust(p_value, method = "bonferroni"),
-    sig_bonferroni = p_bonferroni < alpha
-  )
+  mutate(p_bonferroni = p.adjust(p_value, method = "bonferroni"),
+         sig_bonferroni = p_bonferroni < alpha)
 
-message("Significant after Bonferroni (p < ", alpha, "): ",
-        sum(mw_table$sig_bonferroni, na.rm = TRUE))
+message("\nTotal tests: ", nrow(mw_table))
+message("Significant (p<", alpha, "): ", sum(mw_table$significant, na.rm = TRUE))
+message("Significant (Bonferroni): ", sum(mw_table$sig_bonferroni, na.rm = TRUE))
 
 
 # -------------------------------------------------------------
-# SECTION 6: Build Period × Variable Significance Matrix
+# SECTION 5: Persistent Places — MULTI vs Background  [NEW]
 # -------------------------------------------------------------
 
-message("\nBuilding significance matrix...")
+message("\n=== PERSISTENT PLACES: MULTI-period sites (n=60) vs background ===")
+message("These are sites attributed to more than one Palaeolithic period in")
+message("source literature — repeat/persistent-use locations across the")
+message("cultural sequence. Tested here on the same variable battery,")
+message("reported separately from LP/MP/UP period-stratified results.")
 
-# Significance matrix — p_value
-sig_matrix_p <- mw_table %>%
-  select(variable, period, p_value) %>%
-  pivot_wider(names_from  = period,
-              values_from = p_value) %>%
-  column_to_rownames("variable")
+multi_results <- list()
+for (var in analysis_vars) {
+  multi_results[[var]] <- run_mw_test(full_matrix, var, "multi")
+}
+multi_table <- bind_rows(multi_results) %>%
+  mutate(p_bonferroni = p.adjust(p_value, method = "bonferroni"),
+         sig_bonferroni = p_bonferroni < alpha)
 
-# Significance matrix — binary (significant / not)
-sig_matrix_bin <- mw_table %>%
-  select(variable, period, significant) %>%
-  pivot_wider(names_from  = period,
-              values_from = significant) %>%
-  column_to_rownames("variable")
+message("\nPersistent Places — significant variables (p<", alpha, "):")
+print(multi_table %>% filter(significant == TRUE) %>% arrange(p_value) %>%
+        select(variable, p_value, direction, median_site, median_bg, n_site))
 
-# Direction matrix
-dir_matrix <- mw_table %>%
-  select(variable, period, direction) %>%
-  pivot_wider(names_from  = period,
-              values_from = direction) %>%
-  column_to_rownames("variable")
+write_csv(multi_table, file.path(chapter_root, "07_Statistics", "persistent_places_MULTI_vs_background.csv"))
+message("Saved: persistent_places_MULTI_vs_background.csv [NEW — potential")
+message("Results subsection: 'Persistent Places: multi-period reoccupation']")
 
-message("Significance matrix dimensions: ",
-        nrow(sig_matrix_p), " variables × ",
-        ncol(sig_matrix_p), " periods")
 
-# Print full results
-message("\n=== SIGNIFICANCE MATRIX (p-values) ===")
-print(round(sig_matrix_p, 4))
+# -------------------------------------------------------------
+# SECTION 6: Significance Matrices (unchanged logic)
+# -------------------------------------------------------------
+
+sig_matrix_p <- mw_table %>% select(variable, period, p_value) %>%
+  pivot_wider(names_from = period, values_from = p_value) %>% column_to_rownames("variable")
+sig_matrix_bin <- mw_table %>% select(variable, period, significant) %>%
+  pivot_wider(names_from = period, values_from = significant) %>% column_to_rownames("variable")
+dir_matrix <- mw_table %>% select(variable, period, direction) %>%
+  pivot_wider(names_from = period, values_from = direction) %>% column_to_rownames("variable")
 
 message("\n=== SIGNIFICANT VARIABLES PER PERIOD ===")
 for (per in periods) {
-  sig_vars <- mw_table %>%
-    filter(period == per, significant == TRUE) %>%
-    arrange(p_value) %>%
-    select(variable, p_value, direction, median_site, median_bg)
-  message("\n", per, " — ", nrow(sig_vars),
-          " significant variables (p < ", alpha, "):")
+  sig_vars <- mw_table %>% filter(period == per, significant == TRUE) %>%
+    arrange(p_value) %>% select(variable, p_value, direction, median_site, median_bg)
+  message("\n", per, " — ", nrow(sig_vars), " significant (p<", alpha, "):")
   print(sig_vars)
 }
 
 
 # -------------------------------------------------------------
-# SECTION 7: Compute Effect Sizes (Rank-Biserial Correlation)
+# SECTION 7: Effect Sizes — Rank-Biserial Correlation (unchanged)
 # -------------------------------------------------------------
-
-message("\nComputing effect sizes...")
 
 compute_rbc <- function(data, variable, period_filter) {
   test_data <- data %>%
     filter(point_type == "background" |
              (point_type == "site" & period == period_filter)) %>%
     mutate(group = ifelse(point_type == "site", 1, 0)) %>%
-    select(group, value = all_of(variable)) %>%
-    filter(!is.na(value))
-  
-  n_site <- sum(test_data$group == 1)
-  n_bg   <- sum(test_data$group == 0)
-  
+    select(group, value = all_of(variable)) %>% filter(!is.na(value))
+  n_site <- sum(test_data$group == 1); n_bg <- sum(test_data$group == 0)
   if (n_site < 3) return(NA)
-  
-  w <- wilcox.test(
-    value ~ group, data = test_data,
-    exact = FALSE
-  )$statistic
-  
-  # Rank-biserial correlation
-  rbc <- 1 - (2 * w) / (n_site * n_bg)
-  round(as.numeric(rbc), 3)
+  w <- wilcox.test(value ~ group, data = test_data, exact = FALSE)$statistic
+  round(as.numeric(1 - (2 * w) / (n_site * n_bg)), 3)
 }
 
-effect_sizes <- expand.grid(
-  variable = analysis_vars,
-  period   = periods,
-  stringsAsFactors = FALSE
-) %>%
-  rowwise() %>%
-  mutate(
-    rbc = compute_rbc(full_matrix, variable, period)
-  ) %>%
-  ungroup()
-
-# Add to main table
-mw_table <- mw_table %>%
-  left_join(effect_sizes, by = c("variable", "period"))
-
-message("Effect sizes computed.")
+effect_sizes <- expand.grid(variable = analysis_vars, period = periods, stringsAsFactors = FALSE) %>%
+  rowwise() %>% mutate(rbc = compute_rbc(full_matrix, variable, period)) %>% ungroup()
+mw_table <- mw_table %>% left_join(effect_sizes, by = c("variable", "period"))
 
 
 # -------------------------------------------------------------
-# SECTION 8: Summary Statistics per Period
+# SECTION 8: Period Summary (unchanged logic)
 # -------------------------------------------------------------
 
-message("\n=== PERIOD SUMMARY ===")
-
-period_summary <- mw_table %>%
-  filter(!is.na(significant)) %>%
-  group_by(period) %>%
-  summarise(
-    n_vars_tested   = n(),
-    n_significant   = sum(significant, na.rm = TRUE),
-    n_sig_bonf      = sum(sig_bonferroni, na.rm = TRUE),
-    pct_significant = round(100 * mean(significant, na.rm = TRUE), 1),
-    top_variable    = variable[which.min(p_value)],
-    lowest_p        = round(min(p_value, na.rm = TRUE), 4),
-    .groups = "drop"
-  )
-
+period_summary <- mw_table %>% filter(!is.na(significant)) %>% group_by(period) %>%
+  summarise(n_vars_tested = n(), n_significant = sum(significant, na.rm = TRUE),
+            n_sig_bonf = sum(sig_bonferroni, na.rm = TRUE),
+            pct_significant = round(100 * mean(significant, na.rm = TRUE), 1),
+            top_variable = variable[which.min(p_value)],
+            lowest_p = round(min(p_value, na.rm = TRUE), 4), .groups = "drop")
 print(period_summary)
 
 
-# -------------------------------------------------------------
-# SECTION 9: Save Statistical Outputs
-# -------------------------------------------------------------
+# =============================================================
+# SECTION 9: Spatial Block Bootstrap — Headline Structural Claim [NEW]
+# =============================================================
+# Standard MW + Bonferroni does not correct for spatial pseudo-
+# replication: neither sites nor background points are spatially
+# independent (structural geology, soils, climate are all spatially
+# autocorrelated). This provides a spatially-aware robustness check
+# specifically for the structural-geology result the Discussion
+# leans on hardest (dist_fault/dyke/lineament/shear, LP & MP).
+# Block bootstrap: resample spatial BLOCKS with replacement (not
+# individual points), preserving within-block spatial correlation,
+# recompute the median site-background difference each iteration,
+# build an empirical 95% CI. If the CI excludes zero, the effect
+# survives accounting for spatial structure.
 
-message("\nSaving outputs...")
+message("\n=== SPATIAL BLOCK BOOTSTRAP: structural geology, LP & MP ===")
+
+spatial_block_size_m <- 10000  # 10km grid blocks — adjust if needed
+
+full_matrix_coords <- full_matrix %>%
+  left_join(master_matrix %>% select(point_id, easting, northing), by = "point_id") %>%
+  mutate(
+    block_x = floor(easting  / spatial_block_size_m),
+    block_y = floor(northing / spatial_block_size_m),
+    block_id = paste0(block_x, "_", block_y)
+  )
+
+n_blocks <- length(unique(full_matrix_coords$block_id))
+message("Study area divided into ", n_blocks, " spatial blocks (", spatial_block_size_m/1000, "km grid).")
+
+block_bootstrap_test <- function(data, variable, period_filter, n_boot = 1000) {
+  test_data <- data %>%
+    filter(point_type == "background" |
+             (point_type == "site" & period == period_filter)) %>%
+    mutate(group = ifelse(point_type == "site", "site", "background")) %>%
+    select(group, value = all_of(variable), block_id) %>%
+    filter(!is.na(value))
+  
+  obs_diff <- median(test_data$value[test_data$group == "site"], na.rm = TRUE) -
+    median(test_data$value[test_data$group == "background"], na.rm = TRUE)
+  
+  blocks <- unique(test_data$block_id)
+  n_b <- length(blocks)
+  boot_diffs <- numeric(n_boot)
+  
+  for (i in seq_len(n_boot)) {
+    sampled_blocks <- sample(blocks, size = n_b, replace = TRUE)
+    boot_data <- bind_rows(lapply(sampled_blocks, function(b) test_data %>% filter(block_id == b)))
+    site_vals <- boot_data$value[boot_data$group == "site"]
+    bg_vals   <- boot_data$value[boot_data$group == "background"]
+    if (length(site_vals) < 3 || length(bg_vals) < 3) { boot_diffs[i] <- NA; next }
+    boot_diffs[i] <- median(site_vals, na.rm = TRUE) - median(bg_vals, na.rm = TRUE)
+  }
+  
+  boot_diffs <- boot_diffs[!is.na(boot_diffs)]
+  ci <- quantile(boot_diffs, c(0.025, 0.975), na.rm = TRUE)
+  
+  tibble(variable = variable, period = period_filter, n_blocks = n_b,
+         observed_diff = round(obs_diff, 1),
+         boot_ci_low = round(ci[1], 1), boot_ci_high = round(ci[2], 1),
+         ci_excludes_zero = (ci[1] > 0 & ci[2] > 0) | (ci[1] < 0 & ci[2] < 0),
+         n_valid_boot = length(boot_diffs))
+}
+
+headline_vars <- c("dist_fault", "dist_dyke", "dist_lineament", "dist_shear")
+headline_periods <- c("LP", "MP")
+
+message("\nRunning ", length(headline_vars) * length(headline_periods),
+        " block-bootstrap tests (1000 iterations each — this takes a moment)...")
+
+block_boot_results <- list()
+for (per in headline_periods) {
+  for (var in headline_vars) {
+    message("  ", per, " - ", var, "...")
+    block_boot_results[[paste(per, var)]] <- block_bootstrap_test(full_matrix_coords, var, per)
+  }
+}
+block_boot_table <- bind_rows(block_boot_results)
+
+message("\n=== SPATIAL BLOCK BOOTSTRAP RESULTS ===")
+print(block_boot_table)
+
+n_survive <- sum(block_boot_table$ci_excludes_zero)
+message("\n", n_survive, " of ", nrow(block_boot_table),
+        " headline structural results have a bootstrap CI excluding zero")
+message("(i.e. survive spatial-block resampling). Compare against the",
+        " original MW/Bonferroni significance — any result significant in")
+message("MW but NOT surviving here should be downgraded in Discussion language")
+message("from 'robust' to 'nominally significant, sensitive to spatial structure'.")
+
+write_csv(block_boot_table, file.path(chapter_root, "07_Statistics", "spatial_block_bootstrap_structural.csv"))
+message("Saved: spatial_block_bootstrap_structural.csv [REQUIRED before using",
+        " 'analytically most robust' language in Discussion 7.2]")
+
+
+# -------------------------------------------------------------
+# SECTION 10: Save All Statistical Outputs
+# -------------------------------------------------------------
 
 out_path <- file.path(chapter_root, "07_Statistics")
 
-# Full MW results table
-write_csv(
-  mw_table,
-  file.path(out_path, "mann_whitney_results_full.csv")
-)
-message("Saved: mann_whitney_results_full.csv")
+write_csv(mw_table, file.path(out_path, "mann_whitney_results_full.csv"))
+write_csv(sig_matrix_p %>% rownames_to_column("variable"), file.path(out_path, "significance_matrix_pvalues.csv"))
+write_csv(sig_matrix_bin %>% rownames_to_column("variable"), file.path(out_path, "significance_matrix_binary.csv"))
+write_csv(period_summary, file.path(chapter_root, "11_Tables", "Table_02_MW_Period_Summary.csv"))
+message("\nSaved: mann_whitney_results_full.csv, significance matrices, Table_02")
 
-# Significance matrix p-values
-write_csv(
-  sig_matrix_p %>% rownames_to_column("variable"),
-  file.path(out_path, "significance_matrix_pvalues.csv")
-)
-message("Saved: significance_matrix_pvalues.csv")
-
-# Significance matrix binary
-write_csv(
-  sig_matrix_bin %>% rownames_to_column("variable"),
-  file.path(out_path, "significance_matrix_binary.csv")
-)
-message("Saved: significance_matrix_binary.csv")
-
-# Period summary table
-write_csv(
-  period_summary,
-  file.path(chapter_root, "11_Tables",
-            "Table_02_MW_Period_Summary.csv")
-)
-message("Saved: Table_02_MW_Period_Summary.csv")
-
-# RData
-save(
-  mw_table,
-  sig_matrix_p,
-  sig_matrix_bin,
-  dir_matrix,
-  period_summary,
-  full_matrix,
-  analysis_vars,
-  file = file.path(out_path, "mann_whitney_results.RData")
-)
+save(mw_table, sig_matrix_p, sig_matrix_bin, dir_matrix, period_summary,
+     multi_table, block_boot_table, full_matrix, full_matrix_coords, analysis_vars,
+     file = file.path(out_path, "mann_whitney_results.RData"))
 message("Saved: mann_whitney_results.RData")
 
 
 # -------------------------------------------------------------
-# SECTION 10: Figure — Significance Heatmap (Fig. 10)
+# SECTION 11: Log Session
 # -------------------------------------------------------------
 
-message("\nGenerating significance heatmap (Fig. 10)...")
-
-# Prepare -log10(p) matrix for heatmap
-heat_data <- sig_matrix_p %>%
-  mutate(across(everything(), ~-log10(pmax(., 1e-10))))
-
-# Significance threshold line at -log10(0.05) = 1.301
-sig_threshold <- -log10(alpha)
-
-# Clean variable labels
-rownames(heat_data) <- gsub("_", " ", rownames(heat_data))
-rownames(heat_data) <- gsub("chelsa ", "CHELSA ", rownames(heat_data))
-rownames(heat_data) <- gsub("soil ", "Soil ", rownames(heat_data))
-rownames(heat_data) <- gsub("dist ", "Dist ", rownames(heat_data))
-rownames(heat_data) <- gsub("burial depth m", "Burial Depth", rownames(heat_data))
-rownames(heat_data) <- gsub("elevation", "Elevation", rownames(heat_data))
-
-png(
-  file.path(chapter_root, "10_Figures",
-            "Fig10_Significance_Matrix_Heatmap.png"),
-  width  = 120,
-  height = fig_width,
-  units  = "mm",
-  res    = fig_dpi
-)
-
-pheatmap(
-  as.matrix(heat_data),
-  color            = colorRampPalette(
-    c("white", "#FFF7BC", "#FD8D3C", "#BD0026"))(100),
-  cluster_rows     = TRUE,
-  cluster_cols     = FALSE,
-  display_numbers  = FALSE,
-  border_color     = "grey80",
-  fontsize         = 7,
-  fontsize_row     = 6,
-  fontsize_col     = 9,
-  main             = expression(paste(
-    "Geoenvironmental Significance Matrix (", -log[10](p), ")"
-  )),
-  angle_col        = 0,
-  legend_breaks    = c(0, 1.301, 2, 3, 4),
-  legend_labels    = c("0", "p=0.05", "p=0.01", "p=0.001", "p=0.0001"),
-  annotation_col   = data.frame(
-    Period = colnames(heat_data),
-    row.names = colnames(heat_data)
-  )
-)
-
-dev.off()
-message("Fig10 saved: Significance_Matrix_Heatmap.png")
-
-
-# -------------------------------------------------------------
-# SECTION 11: Figure — Box Plots (Fig. 3)
-# -------------------------------------------------------------
-
-message("\nGenerating spectral index box plots (Fig. 3)...")
-
-spectral_vars <- c("NDVI", "NDWI", "MNDWI", "NDBI", "BSI",
-                   "SAVI", "MSAVI")
-
-# Prepare long format for plotting
-plot_data <- full_matrix %>%
-  filter(point_type %in% c("site", "background")) %>%
-  mutate(
-    group = case_when(
-      point_type == "background" ~ "Background",
-      period == "LP" ~ "LP Sites",
-      period == "MP" ~ "MP Sites",
-      period == "UP" ~ "UP Sites"
-    ),
-    group = factor(group,
-                   levels = c("Background", "LP Sites",
-                              "MP Sites", "UP Sites"))
-  ) %>%
-  select(group, all_of(spectral_vars)) %>%
-  pivot_longer(
-    cols      = all_of(spectral_vars),
-    names_to  = "index",
-    values_to = "value"
-  ) %>%
-  filter(!is.na(value))
-
-# Plot
-fig3 <- ggplot(plot_data,
-               aes(x = group, y = value, fill = group)) +
-  geom_boxplot(
-    outlier.size  = 0.3,
-    outlier.alpha = 0.3,
-    lwd           = 0.3
-  ) +
-  facet_wrap(~index, scales = "free_y", ncol = 4) +
-  scale_fill_manual(
-    values = c(
-      "Background" = "grey70",
-      "LP Sites"   = "#2166AC",
-      "MP Sites"   = "#F4A582",
-      "UP Sites"   = "#D6604D"
-    )
-  ) +
-  labs(
-    title    = "Sentinel-2A Spectral Indices at Palaeolithic Site vs Background Locations",
-    subtitle = "Lower Palaeolithic (LP), Middle Palaeolithic (MP), Upper Palaeolithic (UP)",
-    x        = NULL,
-    y        = "Index Value",
-    fill     = "Group",
-    caption  = "Mann-Whitney U tests; p < 0.05 threshold"
-  ) +
-  theme_bw(base_size = 8) +
-  theme(
-    axis.text.x      = element_text(angle = 45, hjust = 1,
-                                    size = 6),
-    strip.background = element_rect(fill = "grey90"),
-    strip.text       = element_text(face = "bold", size = 7),
-    legend.position  = "bottom",
-    plot.title       = element_text(size = 8, face = "bold"),
-    plot.subtitle    = element_text(size = 7)
-  )
-
-ggsave(
-  file.path(chapter_root, "10_Figures",
-            "Fig03_Spectral_Boxplots.png"),
-  fig3,
-  width  = fig_width / 25.4,
-  height = 140 / 25.4,
-  dpi    = fig_dpi,
-  units  = "in"
-)
-message("Fig03 saved: Spectral_Boxplots.png")
-
-
-# -------------------------------------------------------------
-# SECTION 12: Figure — Structural Geology Box Plots
-# -------------------------------------------------------------
-
-message("\nGenerating structural geology box plots...")
-
-struct_vars_plot <- c("dist_fault", "dist_dyke",
-                      "dist_lineament", "dist_shear",
-                      "dist_mineral")
-
-struct_plot_data <- full_matrix %>%
-  filter(point_type %in% c("site", "background")) %>%
-  mutate(
-    group = case_when(
-      point_type == "background" ~ "Background",
-      period == "LP" ~ "LP Sites",
-      period == "MP" ~ "MP Sites",
-      period == "UP" ~ "UP Sites"
-    ),
-    group = factor(group,
-                   levels = c("Background", "LP Sites",
-                              "MP Sites", "UP Sites"))
-  ) %>%
-  select(group, all_of(struct_vars_plot)) %>%
-  mutate(across(all_of(struct_vars_plot), ~. / 1000)) %>%
-  pivot_longer(
-    cols      = all_of(struct_vars_plot),
-    names_to  = "feature",
-    values_to = "distance_km"
-  ) %>%
-  mutate(
-    feature = recode(feature,
-                     "dist_fault"     = "Fault",
-                     "dist_dyke"      = "Dyke",
-                     "dist_lineament" = "Lineament",
-                     "dist_shear"     = "Shear Zone",
-                     "dist_mineral"   = "Mineral Deposit"
-    )
-  ) %>%
-  filter(!is.na(distance_km))
-
-fig5 <- ggplot(struct_plot_data,
-               aes(x = group, y = distance_km, fill = group)) +
-  geom_boxplot(
-    outlier.size  = 0.3,
-    outlier.alpha = 0.3,
-    lwd           = 0.3
-  ) +
-  facet_wrap(~feature, scales = "free_y", ncol = 3) +
-  scale_fill_manual(
-    values = c(
-      "Background" = "grey70",
-      "LP Sites"   = "#2166AC",
-      "MP Sites"   = "#F4A582",
-      "UP Sites"   = "#D6604D"
-    )
-  ) +
-  labs(
-    title    = "Proximity to Structural Geological Features",
-    subtitle = "Distance (km) from site and background locations",
-    x        = NULL,
-    y        = "Distance (km)",
-    fill     = "Group"
-  ) +
-  theme_bw(base_size = 8) +
-  theme(
-    axis.text.x      = element_text(angle = 45, hjust = 1,
-                                    size = 6),
-    strip.background = element_rect(fill = "grey90"),
-    strip.text       = element_text(face = "bold", size = 7),
-    legend.position  = "bottom",
-    plot.title       = element_text(size = 8, face = "bold")
-  )
-
-ggsave(
-  file.path(chapter_root, "10_Figures",
-            "Fig05_Structural_Geology_Boxplots.png"),
-  fig5,
-  width  = fig_width / 25.4,
-  height = 120 / 25.4,
-  dpi    = fig_dpi,
-  units  = "in"
-)
-message("Fig05 saved: Structural_Geology_Boxplots.png")
-
-
-# -------------------------------------------------------------
-# SECTION 13: Log Session
-# -------------------------------------------------------------
-
-log_file <- file.path(chapter_root, "13_Logs",
-                      paste0("script06_log_", Sys.Date(), ".txt"))
+log_file <- file.path(chapter_root, "13_Logs", paste0("script06_log_", Sys.Date(), ".txt"))
 sink(log_file)
-cat("SCRIPT 06 LOG — Mann-Whitney U Tests\n")
+cat("SCRIPT 06 LOG (REBUILT) — Mann-Whitney U Tests\n")
 cat("Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
-cat("Variables tested:", length(analysis_vars), "\n")
-cat("Periods tested:", paste(periods, collapse = ", "), "\n")
+cat("Analysis variables:", length(analysis_vars), "(burial_depth_m excluded,",
+    "6 geochem major-oxide PCs added)\n")
 cat("Total tests:", nrow(mw_table), "\n")
-cat("Significant (p < 0.05):",
-    sum(mw_table$significant, na.rm = TRUE), "\n")
-cat("Significant (Bonferroni):",
-    sum(mw_table$sig_bonferroni, na.rm = TRUE), "\n\n")
-cat("Period summary:\n")
-print(period_summary)
-cat("\nFull significance matrix (p-values):\n")
-print(round(sig_matrix_p, 4))
+cat("Significant (p<0.05):", sum(mw_table$significant, na.rm=TRUE), "\n")
+cat("Significant (Bonferroni):", sum(mw_table$sig_bonferroni, na.rm=TRUE), "\n\n")
+cat("Period summary:\n"); print(period_summary)
+cat("\nPersistent Places (MULTI vs background) — significant vars:\n")
+print(multi_table %>% filter(significant==TRUE) %>% arrange(p_value))
+cat("\nSpatial block bootstrap — headline structural claim:\n")
+print(block_boot_table)
 sink()
-
 message("Log saved: ", log_file)
 
 
@@ -646,12 +412,11 @@ message("Log saved: ", log_file)
 # -------------------------------------------------------------
 
 message("\n=============================================================")
-message("Script 06 complete.")
-message("Mann-Whitney U tests: ", nrow(mw_table), " total")
-message("Significant (p<0.05): ",
-        sum(mw_table$significant, na.rm = TRUE))
-message("Significant (Bonferroni): ",
-        sum(mw_table$sig_bonferroni, na.rm = TRUE))
-message("Figures saved: Fig03, Fig05, Fig10")
-message("Next: Run Script 07 — PCA + Random Forest")
+message("Script 06 (REBUILT) complete.")
+message("Analysis vars: ", length(analysis_vars), " (was 25, now +6 geochem -1 burial)")
+message("MW tests: ", nrow(mw_table), " | Persistent Places: ", nrow(multi_table))
+message("Spatial block bootstrap: ", n_survive, "/", nrow(block_boot_table), " headline results survive")
+message("Next: Script 07 — PCA + Random Forest")
+message("  (FAMD/split ordinal-continuous vars, spatial block CV for RF,")
+message("  permutation/grouped importance, CHELSA-LGM with/without sensitivity)")
 message("=============================================================")

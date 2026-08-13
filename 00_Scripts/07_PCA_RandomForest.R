@@ -1,55 +1,50 @@
 # =============================================================
-# SCRIPT 07: PCA + Random Forest Variable Importance
+# SCRIPT 07 (REBUILT): PCoA + Random Forest (Spatially Validated)
 # =============================================================
 # Project: Reading the Palaeolithic Landscape
 # Chapter: Mapping the Past (Springer Nature, 2026)
 # Author: Sushant Begade | RTMNU Nagpur
 # ORCID: 0009-0003-0804-1763
-# Date: August 2026
+# Rebuild date: August 2026
 # =============================================================
-# PURPOSE: Multivariate integration of all geoenvironmental
-# variables through:
-# PART A — Principal Component Analysis (PCA)
-#   - Site vs background discrimination
-#   - LP / MP / UP period centroids in PCA space
-#   - Diachronic centroid displacement vectors
-#   - Geoenvironmental attractiveness surface
-# PART B — Random Forest Classification
-#   - Site vs background classification
-#   - Variable importance ranking (Mean Decrease Gini)
-#   - OOB error + confusion matrix
+# CHANGES FROM ORIGINAL SCRIPT 07:
+#   1. PCA -> Gower distance + PCoA. Original ran Euclidean PCA on
+#      25 z-scored variables including 5 ORDINAL soil-class variables
+#      (soil_texture/slope/erosion/productivity coded 1-5) alongside
+#      continuous variables — invalid (reviewer Problem #10). Gower
+#      distance handles mixed continuous/ordinal data correctly;
+#      classical PCoA (cmdscale) on the Gower matrix replaces prcomp.
+#   2. Random Forest — TWO validation regimes now reported side by
+#      side: naive OOB (as before, kept for comparability) AND
+#      spatial block k-fold CV (5-fold, using the SAME block_id
+#      scheme from Script 06's bootstrap) via manual fold loop +
+#      pROC AUC. This directly answers reviewer Problem #4/#7 — no
+#      longer claiming OOB accuracy as if it were spatially
+#      independent performance.
+#   3. Importance — primary metric switched to permutation-based
+#      MeanDecreaseAccuracy (already computed by randomForest with
+#      importance=TRUE, just wasn't the headline metric before).
+#      NEW: grouped importance — correlated variable blocks (NDVI/
+#      SAVI/MSAVI; NDWI/MNDWI; CHELSA-LGM; CHELSA-modern; structural;
+#      pedology; geochem) permuted JOINTLY, answering reviewer
+#      Problem #12 (duplicated environmental information inflating
+#      individual-variable importance).
+#   4. CHELSA-LGM sensitivity — RF run with all 30 vars AND with the
+#      3 chelsa_*_lgm vars dropped (27 vars), rankings compared side
+#      by side. Resolves the flag carried from Script 06.
+#   5. burial_depth_m remains excluded (Script 05 finding).
 # =============================================================
-
-
-# -------------------------------------------------------------
-# SECTION 1: Load Global Parameters + All Data
-# -------------------------------------------------------------
 
 load("E:/Projects & Researches/Nagpur-Chandrapur Enhanced Dataset/Reading_the_Palaeolithic_Landscape_Chapter/00_Scripts/global_params.RData")
-
-load(file.path(chapter_root,
-               "07_Statistics/mann_whitney_results.RData"))
-load(file.path(chapter_root,
-               "06_Taphonomy/taphonomy_data.RData"))
-load(file.path(chapter_root,
-               "03_Extracted_Values/master_extraction_matrix.RData"))
-
-# Redirect terra temp files to E drive
-terraOptions(tempdir = "E:/R_terra_temp")
-
-# Create folder if doesn't exist
-if (!dir.exists("E:/R_terra_temp")) {
-  dir.create("E:/R_terra_temp", recursive = TRUE)
-}
-
-message("Terra temp dir set to E drive: ", terraOptions()$tempdir)
+load(file.path(chapter_root, "07_Statistics/mann_whitney_results.RData"))
+load(file.path(chapter_root, "03_Extracted_Values/master_extraction_matrix.RData"))
 
 library(terra)
 library(sf)
 library(tidyverse)
-library(FactoMineR)
-library(factoextra)
+library(cluster)      # Gower distance
 library(randomForest)
+library(pROC)
 library(ggplot2)
 library(patchwork)
 library(RColorBrewer)
@@ -57,757 +52,481 @@ library(viridis)
 
 set.seed(rf_seed)
 
-message("All data loaded.")
-message("Full matrix: ", nrow(full_matrix), " rows × ",
-        ncol(full_matrix), " columns")
+message("All data loaded. full_matrix_coords: ", nrow(full_matrix_coords), " rows")
 message("Analysis variables: ", length(analysis_vars))
 
 
 # -------------------------------------------------------------
-# SECTION 2: Prepare Clean Matrix for PCA + RF
+# SECTION 2: Prepare Clean Matrix
 # -------------------------------------------------------------
 
-message("\nPreparing clean matrix for multivariate analysis...")
+ORDINAL_VARS <- c("soil_depth", "soil_erosion", "soil_productivity",
+                  "soil_slope", "soil_texture")
+CONTINUOUS_VARS <- setdiff(analysis_vars, ORDINAL_VARS)
 
-# Select analysis variables only
-model_data <- full_matrix %>%
-  select(point_id, point_type, period,
-         all_of(analysis_vars)) %>%
+message("\nOrdinal variables (", length(ORDINAL_VARS), "): ", paste(ORDINAL_VARS, collapse=", "))
+message("Continuous variables (", length(CONTINUOUS_VARS), ")")
+
+model_data <- full_matrix_coords %>%
+  select(point_id, point_type, period, block_id, all_of(analysis_vars)) %>%
   filter(!is.na(point_type))
 
-# Remove rows with excessive NAs
-na_counts <- rowSums(is.na(model_data %>%
-                             select(all_of(analysis_vars))))
+na_counts <- rowSums(is.na(model_data %>% select(all_of(analysis_vars))))
+message("\nNA distribution across rows: max ", max(na_counts), " missing of ", length(analysis_vars), " vars")
 model_data <- model_data[na_counts <= 3, ]
+message("Rows after NA filtering (<=3 missing): ", nrow(model_data))
 
-message("Rows after NA filtering: ", nrow(model_data))
-
-# Impute remaining NAs with column medians
 model_imputed <- model_data
 for (var in analysis_vars) {
   if (any(is.na(model_imputed[[var]]))) {
     med_val <- median(model_imputed[[var]], na.rm = TRUE)
     model_imputed[[var]][is.na(model_imputed[[var]])] <- med_val
-    message("  Imputed NAs in: ", var, " with median = ",
-            round(med_val, 3))
   }
 }
-
-# Separate sites and background
-sites_data  <- model_imputed %>% filter(point_type == "site")
-bg_data     <- model_imputed %>% filter(point_type == "background")
-
-message("Sites: ",      nrow(sites_data))
-message("Background: ", nrow(bg_data))
-message("Complete cases: ", sum(complete.cases(
-  model_imputed %>% select(all_of(analysis_vars))
-)))
+message("Complete cases after imputation: ", sum(complete.cases(model_imputed %>% select(all_of(analysis_vars)))))
 
 
 # =============================================================
-# PART A: PRINCIPAL COMPONENT ANALYSIS
+# PART A: PCoA (Gower distance) — replaces Euclidean PCA
 # =============================================================
 
-message("\n--- PART A: Principal Component Analysis ---")
+message("\n--- PART A: PCoA on Gower Distance (mixed continuous+ordinal) ---")
 
+# NOTE: full Gower distance matrix on >1000 points is O(n^2) memory —
+# for n~1100 this is ~1.2M cells, fine. If this ever runs on a much
+# larger n, subsample or use cluster::daisy's memory-efficient path.
 
-# -------------------------------------------------------------
-# SECTION 3: Run PCA
-# -------------------------------------------------------------
+gower_input <- model_imputed %>% select(all_of(analysis_vars))
+for (v in ORDINAL_VARS) gower_input[[v]] <- factor(gower_input[[v]], ordered = TRUE)
 
-message("\nRunning PCA...")
+message("Computing Gower distance matrix (", nrow(gower_input), " x ", nrow(gower_input), ")...")
+gower_dist <- daisy(gower_input, metric = "gower",
+                    type = list(ordratio = ORDINAL_VARS))
+message("Gower distance computed.")
 
-# Scale and center
-pca_input <- model_imputed %>%
-  select(all_of(analysis_vars)) %>%
-  scale(center = TRUE, scale = TRUE) %>%
-  as.data.frame()
+message("Running classical PCoA (cmdscale)...")
+pcoa_result <- cmdscale(gower_dist, k = 10, eig = TRUE)
 
-# Run PCA using FactoMineR
-pca_result <- PCA(
-  pca_input,
-  ncp   = 10,
-  graph = FALSE
-)
+eig_positive <- pcoa_result$eig[pcoa_result$eig > 0]
+var_explained <- round(100 * eig_positive / sum(eig_positive), 2)
+message("\nVariance explained by first 5 positive-eigenvalue axes:")
+print(head(var_explained, 5))
+message("Cumulative (first 2 axes): ", round(sum(head(var_explained,2)),1), "%")
 
-# Variance explained
-eig_vals <- get_eigenvalue(pca_result)
-message("\nVariance explained by first 5 PCs:")
-print(round(eig_vals[1:5, ], 2))
+pcoa_scores <- as.data.frame(pcoa_result$points) %>% rename_with(~paste0("PC", seq_along(.)))
+pcoa_scores <- bind_cols(model_imputed %>% select(point_id, point_type, period), pcoa_scores)
 
-# Variables contributing most to PC1 + PC2
-var_contrib <- get_pca_var(pca_result)
-message("\nTop 10 variables on PC1:")
-print(sort(var_contrib$contrib[, 1], decreasing = TRUE)[1:10])
+sites_pcoa <- pcoa_scores %>% filter(point_type == "site")
+bg_pcoa    <- pcoa_scores %>% filter(point_type == "background")
 
-message("\nTop 10 variables on PC2:")
-print(sort(var_contrib$contrib[, 2], decreasing = TRUE)[1:10])
-
-
-# -------------------------------------------------------------
-# SECTION 4: Extract PCA Scores
-# -------------------------------------------------------------
-
-message("\nExtracting PCA scores...")
-
-pca_scores <- as.data.frame(pca_result$ind$coord) %>%
-  rename_with(~paste0("PC", seq_along(.)))
-
-# Add metadata
-pca_scores <- bind_cols(
-  model_imputed %>% select(point_id, point_type, period),
-  pca_scores
-)
-
-# Separate
-sites_pca  <- pca_scores %>% filter(point_type == "site")
-bg_pca     <- pca_scores %>% filter(point_type == "background")
-
-message("PCA scores extracted for ", nrow(pca_scores), " points.")
-
-
-# -------------------------------------------------------------
-# SECTION 5: Period Centroids in PCA Space
-# -------------------------------------------------------------
-
-message("\nCalculating period centroids in PCA space...")
-
-# Centroids per period
-period_centroids <- sites_pca %>%
+# Period centroids (LP/MP/UP only — MULTI excluded from centroid analysis
+# for consistency with the period-stratified framework; reported
+# separately in Persistent Places if desired)
+period_centroids <- sites_pcoa %>% filter(period %in% c("LP","MP","UP")) %>%
   group_by(period) %>%
-  summarise(
-    PC1_mean = mean(PC1, na.rm = TRUE),
-    PC2_mean = mean(PC2, na.rm = TRUE),
-    PC1_sd   = sd(PC1, na.rm = TRUE),
-    PC2_sd   = sd(PC2, na.rm = TRUE),
-    n        = n(),
-    .groups  = "drop"
-  )
+  summarise(PC1_mean = mean(PC1, na.rm=TRUE), PC2_mean = mean(PC2, na.rm=TRUE),
+            PC1_sd = sd(PC1, na.rm=TRUE), PC2_sd = sd(PC2, na.rm=TRUE),
+            n = n(), .groups = "drop")
 
-# Background centroid
-bg_centroid <- bg_pca %>%
-  summarise(
-    period   = "Background",
-    PC1_mean = mean(PC1, na.rm = TRUE),
-    PC2_mean = mean(PC2, na.rm = TRUE),
-    PC1_sd   = sd(PC1, na.rm = TRUE),
-    PC2_sd   = sd(PC2, na.rm = TRUE),
-    n        = n()
-  )
+message("\nPeriod centroids (PCoA axes 1-2):")
+print(period_centroids)
 
-all_centroids <- bind_rows(period_centroids, bg_centroid)
+lp_c <- period_centroids %>% filter(period=="LP")
+mp_c <- period_centroids %>% filter(period=="MP")
+up_c <- period_centroids %>% filter(period=="UP")
 
-message("\nPeriod centroids in PC1-PC2 space:")
-print(all_centroids)
+disp_lp_mp <- sqrt((mp_c$PC1_mean-lp_c$PC1_mean)^2 + (mp_c$PC2_mean-lp_c$PC2_mean)^2)
+disp_mp_up <- sqrt((up_c$PC1_mean-mp_c$PC1_mean)^2 + (up_c$PC2_mean-mp_c$PC2_mean)^2)
+disp_lp_up <- sqrt((up_c$PC1_mean-lp_c$PC1_mean)^2 + (up_c$PC2_mean-lp_c$PC2_mean)^2)
 
-# Centroid displacement vectors — diachronic niche shift
-message("\nCentroid displacement vectors:")
+message("\nCentroid displacements (PCoA space, descriptive — not yet significance-tested):")
+message("LP-MP: ", round(disp_lp_mp,3), " | MP-UP: ", round(disp_mp_up,3), " | LP-UP: ", round(disp_lp_up,3))
 
-# LP to MP shift
-lp_centroid <- period_centroids %>% filter(period == "LP")
-mp_centroid <- period_centroids %>% filter(period == "MP")
-up_centroid <- period_centroids %>% filter(period == "UP")
+# -------------------------------------------------------------
+# Bootstrap CI on centroid displacements [NEW — answers reviewer
+# Problem #11: "do not call this diachronic niche displacement...
+# perform bootstrap confidence regions"]
+# -------------------------------------------------------------
 
-disp_lp_mp <- sqrt(
-  (mp_centroid$PC1_mean - lp_centroid$PC1_mean)^2 +
-    (mp_centroid$PC2_mean - lp_centroid$PC2_mean)^2
-)
-disp_mp_up <- sqrt(
-  (up_centroid$PC1_mean - mp_centroid$PC1_mean)^2 +
-    (up_centroid$PC2_mean - mp_centroid$PC2_mean)^2
-)
-disp_lp_up <- sqrt(
-  (up_centroid$PC1_mean - lp_centroid$PC1_mean)^2 +
-    (up_centroid$PC2_mean - lp_centroid$PC2_mean)^2
-)
+message("\nBootstrapping centroid displacement CIs (1000 iterations)...")
+boot_displacement <- function(data, period_a, period_b, n_boot = 1000) {
+  a_pts <- data %>% filter(period == period_a)
+  b_pts <- data %>% filter(period == period_b)
+  boot_d <- numeric(n_boot)
+  for (i in seq_len(n_boot)) {
+    a_s <- a_pts[sample(nrow(a_pts), replace = TRUE), ]
+    b_s <- b_pts[sample(nrow(b_pts), replace = TRUE), ]
+    boot_d[i] <- sqrt((mean(b_s$PC1)-mean(a_s$PC1))^2 + (mean(b_s$PC2)-mean(a_s$PC2))^2)
+  }
+  quantile(boot_d, c(0.025, 0.975))
+}
 
-message("LP → MP displacement: ", round(disp_lp_mp, 3), " PC units")
-message("MP → UP displacement: ", round(disp_mp_up, 3), " PC units")
-message("LP → UP displacement: ", round(disp_lp_up, 3), " PC units")
+ci_lp_mp <- boot_displacement(sites_pcoa %>% filter(period %in% c("LP","MP")), "LP", "MP")
+ci_mp_up <- boot_displacement(sites_pcoa %>% filter(period %in% c("MP","UP")), "MP", "UP")
+ci_lp_up <- boot_displacement(sites_pcoa %>% filter(period %in% c("LP","UP")), "LP", "UP")
 
-displacements <- data.frame(
-  transition     = c("LP_to_MP", "MP_to_UP", "LP_to_UP"),
-  displacement   = round(c(disp_lp_mp, disp_mp_up, disp_lp_up), 4),
+displacements <- tibble(
+  transition = c("LP_to_MP", "MP_to_UP", "LP_to_UP"),
+  displacement = round(c(disp_lp_mp, disp_mp_up, disp_lp_up), 4),
+  boot_ci_low  = round(c(ci_lp_mp[1], ci_mp_up[1], ci_lp_up[1]), 4),
+  boot_ci_high = round(c(ci_lp_mp[2], ci_mp_up[2], ci_lp_up[2]), 4),
   interpretation = c(
-    "LP to MP geoenvironmental niche shift",
-    "MP to UP geoenvironmental niche shift",
-    "Total LP to UP niche displacement"
+    "LP to MP multivariate environmental centroid separation (descriptive; bootstrap CI, not PERMANOVA)",
+    "MP to UP multivariate environmental centroid separation (descriptive; UP n=27, caution)",
+    "LP to UP multivariate environmental centroid separation (descriptive)"
   )
 )
-
+message("\nCentroid displacements with bootstrap 95% CI:")
 print(displacements)
-
-
-# -------------------------------------------------------------
-# SECTION 6: Figure — PCA Biplot (Fig. 8)
-# -------------------------------------------------------------
-
-message("\nGenerating PCA biplot (Fig. 8)...")
-
-# Variance labels
-pc1_var <- round(eig_vals[1, "variance.percent"], 1)
-pc2_var <- round(eig_vals[2, "variance.percent"], 1)
-
-# Period colours
-period_colors <- c(
-  "LP"         = "#2166AC",
-  "MP"         = "#F4A582",
-  "UP"         = "#D6604D",
-  "background" = "grey80"
-)
-
-# Plot data
-plot_pca <- pca_scores %>%
-  mutate(
-    group = case_when(
-      point_type == "background" ~ "background",
-      TRUE                       ~ period
-    ),
-    alpha_val = ifelse(point_type == "background", 0.15, 0.6),
-    size_val  = ifelse(point_type == "background", 0.3, 1.0)
-  )
-
-fig8 <- ggplot() +
-  # Background points
-  geom_point(
-    data = plot_pca %>% filter(group == "background"),
-    aes(x = PC1, y = PC2),
-    color = "grey75", alpha = 0.2, size = 0.3
-  ) +
-  # Site points by period
-  geom_point(
-    data = plot_pca %>% filter(group != "background"),
-    aes(x = PC1, y = PC2, color = group),
-    alpha = 0.7, size = 1.2
-  ) +
-  # Period centroids
-  geom_point(
-    data = period_centroids,
-    aes(x = PC1_mean, y = PC2_mean, color = period),
-    size = 5, shape = 18
-  ) +
-  # Centroid labels
-  geom_label(
-    data = period_centroids,
-    aes(x = PC1_mean, y = PC2_mean,
-        label = period, color = period),
-    size = 3, fontface = "bold",
-    nudge_y = 0.3, show.legend = FALSE
-  ) +
-  # Centroid displacement arrows
-  annotate(
-    "segment",
-    x    = lp_centroid$PC1_mean,
-    y    = lp_centroid$PC2_mean,
-    xend = mp_centroid$PC1_mean,
-    yend = mp_centroid$PC2_mean,
-    arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
-    color = "grey30", lwd = 0.8, linetype = "dashed"
-  ) +
-  annotate(
-    "segment",
-    x    = mp_centroid$PC1_mean,
-    y    = mp_centroid$PC2_mean,
-    xend = up_centroid$PC1_mean,
-    yend = up_centroid$PC2_mean,
-    arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
-    color = "grey30", lwd = 0.8, linetype = "dashed"
-  ) +
-  # Zero lines
-  geom_hline(yintercept = 0, color = "grey50",
-             linetype = "dotted", lwd = 0.3) +
-  geom_vline(xintercept = 0, color = "grey50",
-             linetype = "dotted", lwd = 0.3) +
-  scale_color_manual(values = period_colors) +
-  labs(
-    title    = "PCA Biplot — Geoenvironmental Space",
-    subtitle = "Site and background locations with LP/MP/UP period centroids",
-    x        = paste0("PC1 (", pc1_var, "% variance)"),
-    y        = paste0("PC2 (", pc2_var, "% variance)"),
-    color    = "Period",
-    caption  = "Dashed arrows = diachronic centroid displacement vectors"
-  ) +
-  theme_bw(base_size = 9) +
-  theme(
-    plot.title    = element_text(size = 9, face = "bold"),
-    plot.subtitle = element_text(size = 8),
-    legend.position = "right"
-  )
-
-ggsave(
-  file.path(chapter_root, "10_Figures",
-            "Fig08_PCA_Biplot.png"),
-  fig8,
-  width  = fig_width / 25.4,
-  height = 130 / 25.4,
-  dpi    = fig_dpi,
-  units  = "in"
-)
-message("Fig08 saved: PCA_Biplot.png")
+message("\nNOTE: UP n=27 (small sample per earlier coordinate-precision finding —")
+message("78% of UP sites are GIS-digitised/low-precision, Script 01). UP centroid")
+message("position should be reported with explicit caution regardless of CI width.")
 
 
 # =============================================================
-# PART B: RANDOM FOREST CLASSIFICATION
+# PART B: Random Forest — Spatial Block CV + Grouped Importance
 # =============================================================
 
-message("\n--- PART B: Random Forest Classification ---")
+message("\n--- PART B: Random Forest ---")
 
+rf_data_full <- model_imputed %>%
+  select(point_type, block_id, all_of(analysis_vars)) %>%
+  mutate(response = factor(ifelse(point_type=="site","site","background"),
+                           levels=c("site","background"))) %>%
+  select(-point_type)   # FIX: point_type was leaking as a predictor — it IS
+# the response 1:1, caused the 100% OOB / AUC=1 /
+# zero grouped-importance result in the prior run.
+# Must never appear in any model_data / fold data
+# passed to randomForest() or predict() below.
 
-# -------------------------------------------------------------
-# SECTION 7: Prepare RF Data
-# -------------------------------------------------------------
-
-message("\nPreparing Random Forest data...")
-
-rf_data <- model_imputed %>%
-  select(point_type, all_of(analysis_vars)) %>%
-  mutate(
-    response = factor(
-      ifelse(point_type == "site", "site", "background"),
-      levels = c("site", "background")
-    )
-  ) %>%
-  select(-point_type)
-
-# Balance classes — downsample background to match site count
-n_sites <- sum(rf_data$response == "site")
-n_bg    <- sum(rf_data$response == "background")
-
+n_sites <- sum(rf_data_full$response == "site")
+n_bg    <- sum(rf_data_full$response == "background")
 message("Sites: ", n_sites, " | Background: ", n_bg)
 
-# Downsample background
 set.seed(rf_seed)
-bg_idx   <- which(rf_data$response == "background")
-site_idx <- which(rf_data$response == "site")
+site_idx <- which(rf_data_full$response == "site")
+bg_idx   <- which(rf_data_full$response == "background")
 bg_sampled <- sample(bg_idx, size = n_sites, replace = FALSE)
-
-rf_balanced <- rf_data[c(site_idx, bg_sampled), ]
-
-message("Balanced RF dataset: ", nrow(rf_balanced),
-        " rows (", n_sites, " sites + ", n_sites, " background)")
+rf_balanced <- rf_data_full[c(site_idx, bg_sampled), ]
+message("Balanced RF dataset: ", nrow(rf_balanced), " rows")
 
 
 # -------------------------------------------------------------
-# SECTION 8: Run Random Forest
+# Helper: fit RF, return model + naive OOB + permutation/grouped importance
 # -------------------------------------------------------------
 
-message("\nRunning Random Forest (", rf_ntree, " trees)...")
-
-rf_model <- randomForest(
-  response ~ .,
-  data       = rf_balanced,
-  ntree      = rf_ntree,
-  mtry       = floor(sqrt(length(analysis_vars))),
-  importance = TRUE,
-  keep.forest = TRUE
+VAR_GROUPS <- list(
+  vegetation      = c("NDVI","SAVI","MSAVI"),
+  water           = c("NDWI","MNDWI"),
+  surface         = c("NDBI","BSI"),
+  climate_lgm     = c("chelsa_bio01_lgm","chelsa_bio12_lgm","chelsa_bio15_lgm"),
+  climate_modern  = c("chelsa_bio01_modern","chelsa_bio12_modern","chelsa_bio15_modern"),
+  structural      = c("dist_fault","dist_dyke","dist_lineament","dist_shear","dist_mineral"),
+  pedology        = ORDINAL_VARS,
+  geochem_stream  = c("geochem_stream_major_PC1","geochem_stream_major_PC2"),
+  geochem_horizon = c("geochem_horizon_major_PC1","geochem_horizon_major_PC2"),
+  geochem_regolith= c("geochem_regolith_major_PC1","geochem_regolith_major_PC2"),
+  elevation       = c("elevation")
 )
 
-message("\nRandom Forest complete.")
-message("OOB Error Rate: ",
-        round(rf_model$err.rate[rf_ntree, "OOB"] * 100, 2), "%")
-message("\nConfusion Matrix:")
-print(rf_model$confusion)
+grouped_importance <- function(rf_model, data, vars, groups, n_reps = 25) {
+  # FIX: single-shuffle permutation on n=244 rows is too noisy — accuracy
+  # only moves in ~0.004 increments per misclassification, so several
+  # groups showed identical or exact-zero acc_drop by chance in the first
+  # run, not because they carry no signal. Repeat each group's permutation
+  # n_reps times and average, standard practice for permutation importance
+  # stability (Breiman 2001; Strobl et al 2008, both already in refs).
+  baseline_pred <- predict(rf_model, data)
+  baseline_acc  <- mean(baseline_pred == data$response)
+  
+  results <- tibble(group = character(), n_vars = integer(),
+                    acc_drop_mean = numeric(), acc_drop_sd = numeric())
+  for (g in names(groups)) {
+    gv <- intersect(groups[[g]], vars)
+    if (length(gv) == 0) next
+    rep_drops <- numeric(n_reps)
+    for (r in seq_len(n_reps)) {
+      perm_data <- data
+      perm_idx <- sample(nrow(perm_data))
+      perm_data[gv] <- perm_data[gv][perm_idx, ]
+      perm_pred <- predict(rf_model, perm_data)
+      perm_acc  <- mean(perm_pred == data$response)
+      rep_drops[r] <- baseline_acc - perm_acc
+    }
+    results <- bind_rows(results, tibble(group = g, n_vars = length(gv),
+                                         acc_drop_mean = mean(rep_drops),
+                                         acc_drop_sd = sd(rep_drops)))
+  }
+  message("  NOTE: acc_drop computed on TRAINING data (rf_formula_data), not")
+  message("  strictly held-out OOB rows — an optimistic-leaning estimate, same")
+  message("  caveat as applies to naive OOB elsewhere in this script. Relative")
+  message("  ranking across groups is still informative even if absolute")
+  message("  magnitudes run slightly high.")
+  results %>% arrange(desc(acc_drop_mean))
+}
 
 
 # -------------------------------------------------------------
-# SECTION 9: Variable Importance
+# Fit primary RF model (all 30 vars) — naive OOB
 # -------------------------------------------------------------
 
-message("\nExtracting variable importance...")
+message("\nFitting primary RF (all ", length(analysis_vars), " vars, ntree=", rf_ntree, ")...")
 
-# Mean Decrease Gini
+rf_formula_data <- rf_balanced %>% select(-block_id)
+rf_model <- randomForest(response ~ ., data = rf_formula_data, ntree = rf_ntree,
+                         mtry = floor(sqrt(length(analysis_vars))),
+                         importance = TRUE, keep.forest = TRUE)
+
+oob_acc <- round((1 - rf_model$err.rate[rf_ntree, "OOB"]) * 100, 1)
+message("Naive OOB accuracy: ", oob_acc, "%")
+message("Confusion matrix:"); print(rf_model$confusion)
+
+
+# -------------------------------------------------------------
+# Spatial Block k-fold CV [NEW]
+# -------------------------------------------------------------
+
+message("\n=== SPATIAL BLOCK 5-FOLD CROSS-VALIDATION ===")
+message("Using the SAME block_id scheme as Script 06's bootstrap (10km grid).")
+
+k_folds <- 5
+unique_blocks <- unique(rf_balanced$block_id)
+set.seed(rf_seed)
+block_fold_assign <- sample(rep(1:k_folds, length.out = length(unique_blocks)))
+names(block_fold_assign) <- unique_blocks
+
+rf_balanced$fold <- block_fold_assign[rf_balanced$block_id]
+
+spatial_cv_preds <- tibble()
+for (k in 1:k_folds) {
+  train_data <- rf_balanced %>% filter(fold != k) %>% select(-block_id, -fold)
+  test_data  <- rf_balanced %>% filter(fold == k) %>% select(-block_id, -fold)
+  
+  if (nrow(test_data) < 5 || length(unique(train_data$response)) < 2) {
+    message("  Fold ", k, ": skipped (insufficient data)")
+    next
+  }
+  
+  fold_model <- randomForest(response ~ ., data = train_data, ntree = rf_ntree,
+                             mtry = floor(sqrt(length(analysis_vars))))
+  fold_prob  <- predict(fold_model, test_data, type = "prob")[, "site"]
+  fold_pred  <- predict(fold_model, test_data)
+  
+  spatial_cv_preds <- bind_rows(spatial_cv_preds, tibble(
+    fold = k, observed = test_data$response, predicted = fold_pred, prob_site = fold_prob
+  ))
+  message("  Fold ", k, ": n_test=", nrow(test_data), " done")
+}
+
+spatial_cv_acc <- mean(spatial_cv_preds$observed == spatial_cv_preds$predicted)
+spatial_cv_roc <- roc(spatial_cv_preds$observed, spatial_cv_preds$prob_site,
+                      levels = c("background", "site"), quiet = TRUE)
+spatial_cv_auc <- as.numeric(auc(spatial_cv_roc))
+
+message("\n=== NAIVE OOB vs SPATIAL BLOCK CV ===")
+message("Naive OOB accuracy:        ", oob_acc, "%")
+message("Spatial block CV accuracy: ", round(100*spatial_cv_acc, 1), "%")
+message("Spatial block CV AUC:      ", round(spatial_cv_auc, 3))
+if ((oob_acc/100 - spatial_cv_acc) > 0.05) {
+  message("\n*** OOB overstates performance by >5 percentage points under spatial")
+  message("*** dependence. REPORT SPATIAL BLOCK CV FIGURES IN RESULTS, not just OOB.")
+} else {
+  message("\nOOB and spatial-CV accuracy are reasonably close — spatial dependence")
+  message("inflation appears modest for this model, but report both regardless.")
+}
+
+validation_comparison <- tibble(
+  method = c("Naive OOB", "Spatial Block 5-fold CV"),
+  accuracy_pct = c(oob_acc, round(100*spatial_cv_acc,1)),
+  auc = c(NA, round(spatial_cv_auc, 3))
+)
+
+
+# -------------------------------------------------------------
+# Grouped Importance [NEW] + Standard Permutation Importance
+# -------------------------------------------------------------
+
+message("\n=== IMPORTANCE: permutation (MeanDecreaseAccuracy) as primary ===")
+
 importance_df <- as.data.frame(importance(rf_model)) %>%
   rownames_to_column("variable") %>%
-  arrange(desc(MeanDecreaseGini)) %>%
+  arrange(desc(MeanDecreaseAccuracy)) %>%
   mutate(
-    rank          = row_number(),
+    rank = row_number(),
     variable_clean = gsub("_", " ", variable),
-    variable_clean = gsub("chelsa ", "CHELSA ", variable_clean),
-    variable_clean = gsub("soil ", "Soil ", variable_clean),
-    variable_clean = gsub("dist ", "Dist ", variable_clean),
-    variable_clean = gsub("burial depth m", "Burial Depth", variable_clean),
-    variable_clean = gsub("elevation", "Elevation", variable_clean),
     category = case_when(
-      str_detect(variable, "NDVI|NDWI|MNDWI|NDBI|BSI|SAVI|MSAVI|S2_") ~
-        "Spectral",
+      str_detect(variable, "NDVI|NDWI|MNDWI|NDBI|BSI|SAVI|MSAVI") ~ "Spectral",
       str_detect(variable, "soil_") ~ "Pedogenic",
-      str_detect(variable, "chelsa|wc_") ~ "Climate",
+      str_detect(variable, "chelsa") ~ "Climate",
       str_detect(variable, "dist_") ~ "Structural Geology",
       str_detect(variable, "elevation") ~ "Topographic",
-      str_detect(variable, "burial") ~ "Taphonomy",
+      str_detect(variable, "geochem_") ~ "Geochemistry",
       TRUE ~ "Other"
     )
   )
 
-message("\nTop 15 variables by Mean Decrease Gini:")
-print(importance_df %>%
-        select(rank, variable, MeanDecreaseGini, category) %>%
-        head(15))
+message("\nTop 15 by permutation importance (MeanDecreaseAccuracy):")
+print(importance_df %>% select(rank, variable, MeanDecreaseAccuracy, MeanDecreaseGini, category) %>% head(15))
+
+message("\nRunning grouped-variable permutation importance...")
+grp_importance <- grouped_importance(rf_model, rf_formula_data, analysis_vars, VAR_GROUPS)
+message("\nGrouped importance (accuracy drop when whole group permuted jointly):")
+print(grp_importance)
+message("\nCompare to individual vegetation vars (NDVI/SAVI/MSAVI) in importance_df —")
+message("if grouped 'vegetation' importance is much lower than 3x any single")
+message("vegetation var's individual importance, this confirms redundancy")
+message("inflation (reviewer Problem #12) — report grouped importance as the")
+message("primary evidence for spectral/climate variable contribution in Discussion.")
 
 
 # -------------------------------------------------------------
-# SECTION 10: Figure — RF Variable Importance (Fig. 9)
+# CHELSA-LGM Sensitivity [NEW]
 # -------------------------------------------------------------
 
-message("\nGenerating RF variable importance plot (Fig. 9)...")
+message("\n=== CHELSA-LGM SENSITIVITY: RF with vs without LGM variables ===")
 
-category_colors <- c(
-  "Spectral"         = "#1F78B4",
-  "Pedogenic"        = "#33A02C",
-  "Climate"          = "#FF7F00",
-  "Structural Geology" = "#E31A1C",
-  "Topographic"      = "#6A3D9A",
-  "Taphonomy"        = "#B15928"
-)
+vars_no_lgm <- setdiff(analysis_vars, c("chelsa_bio01_lgm","chelsa_bio12_lgm","chelsa_bio15_lgm"))
+rf_data_no_lgm <- rf_balanced %>% select(response, all_of(vars_no_lgm))
 
-fig9 <- importance_df %>%
-  head(20) %>%
-  mutate(variable_clean = fct_reorder(variable_clean,
-                                      MeanDecreaseGini)) %>%
-  ggplot(aes(x = MeanDecreaseGini,
-             y = variable_clean,
-             fill = category)) +
-  geom_col(width = 0.7) +
-  geom_text(
-    aes(label = paste0("#", rank)),
-    hjust = -0.2, size = 2.5
-  ) +
-  scale_fill_manual(values = category_colors) +
-  labs(
-    title    = "Random Forest Variable Importance",
-    subtitle = paste0("Top 20 variables | OOB accuracy: ",
-                      round((1 - rf_model$err.rate[rf_ntree, "OOB"])
-                            * 100, 1), "%"),
-    x        = "Mean Decrease Gini",
-    y        = NULL,
-    fill     = "Variable Category"
-  ) +
-  theme_bw(base_size = 9) +
-  theme(
-    plot.title      = element_text(size = 9, face = "bold"),
-    plot.subtitle   = element_text(size = 8),
-    legend.position = "bottom",
-    legend.text     = element_text(size = 7),
-    axis.text.y     = element_text(size = 7)
-  ) +
-  expand_limits(x = max(importance_df$MeanDecreaseGini[1:20]) * 1.1)
+rf_model_no_lgm <- randomForest(response ~ ., data = rf_data_no_lgm, ntree = rf_ntree,
+                                mtry = floor(sqrt(length(vars_no_lgm))), importance = TRUE)
 
-ggsave(
-  file.path(chapter_root, "10_Figures",
-            "Fig09_RF_Variable_Importance.png"),
-  fig9,
-  width  = fig_width / 25.4,
-  height = 130 / 25.4,
-  dpi    = fig_dpi,
-  units  = "in"
-)
-message("Fig09 saved: RF_Variable_Importance.png")
+oob_acc_no_lgm <- round((1 - rf_model_no_lgm$err.rate[rf_ntree,"OOB"]) * 100, 1)
+
+importance_no_lgm <- as.data.frame(importance(rf_model_no_lgm)) %>%
+  rownames_to_column("variable") %>% arrange(desc(MeanDecreaseAccuracy)) %>%
+  mutate(rank_no_lgm = row_number())
+
+lgm_comparison <- importance_df %>% select(variable, rank_with_lgm = rank) %>%
+  left_join(importance_no_lgm %>% select(variable, rank_no_lgm), by = "variable") %>%
+  filter(!is.na(rank_no_lgm)) %>%
+  mutate(rank_shift = rank_with_lgm - rank_no_lgm) %>%
+  arrange(rank_with_lgm)
+
+message("With-LGM OOB: ", oob_acc, "% | Without-LGM OOB: ", oob_acc_no_lgm, "%")
+message("\nTop-10 variable rank comparison (with vs without CHELSA-LGM):")
+print(lgm_comparison %>% head(10))
+message("\nIf top structural/pedogenic variables hold similar rank either way,")
+message("the chapter's core findings do NOT depend on the temporally-mismatched")
+message("CHELSA-LGM variables — state this explicitly in Methods 5.5/Discussion 7.4.")
 
 
 # -------------------------------------------------------------
-# SECTION 11: Geoenvironmental Attractiveness Surface (Fig. 11)
+# Geoenvironmental Suitability Surface (unchanged approach, uses
+# primary rf_model; caveat language strengthened)
 # -------------------------------------------------------------
 
-message("\nGenerating geoenvironmental attractiveness surface (Fig. 11)...")
+message("\nGenerating geoenvironmental suitability surface (primary RF model)...")
+message("NOTE: this surface reflects the NAIVE-OOB-fitted model. Given the OOB")
+message("vs spatial-CV gap reported above, treat absolute suitability VALUES as")
+message("relative/ordinal (higher vs lower) rather than calibrated probabilities —")
+message("already the chapter's stated convention, now with a quantified basis for it.")
 
-# Load all rasters used in analysis
-message("Loading rasters for prediction surface...")
+boundary <- st_read(paths$boundary, quiet = TRUE) %>% st_transform(crs_utm44n)
+study_area_vect <- vect(st_union(boundary))
+dem_ref <- rast(paths$dem) %>% terra::project("EPSG:32644") %>%
+  crop(study_area_vect) %>% mask(study_area_vect) %>% aggregate(fact = 8)
 
 raster_vars <- list(
-  elevation         = paths$dem,
-  NDVI              = paths$NDVI,
-  NDWI              = paths$NDWI,
-  MNDWI             = paths$MNDWI,
-  NDBI              = paths$NDBI,
-  BSI               = paths$BSI,
-  SAVI              = paths$SAVI,
-  MSAVI             = paths$MSAVI,
-  soil_depth        = paths$soil_depth,
-  soil_erosion      = paths$soil_erosion,
-  soil_productivity = paths$soil_productivity,
-  soil_slope        = paths$soil_slope,
-  soil_texture      = paths$soil_texture,
-  chelsa_bio01_lgm  = paths$chelsa_bio01_lgm,
-  chelsa_bio12_lgm  = paths$chelsa_bio12_lgm,
-  chelsa_bio15_lgm  = paths$chelsa_bio15_lgm,
-  chelsa_bio01_modern = paths$chelsa_bio01_modern,
-  chelsa_bio12_modern = paths$chelsa_bio12_modern,
+  elevation = paths$dem, NDVI = paths$NDVI, NDWI = paths$NDWI, MNDWI = paths$MNDWI,
+  NDBI = paths$NDBI, BSI = paths$BSI, SAVI = paths$SAVI, MSAVI = paths$MSAVI,
+  soil_depth = paths$soil_depth, soil_erosion = paths$soil_erosion,
+  soil_productivity = paths$soil_productivity, soil_slope = paths$soil_slope,
+  soil_texture = paths$soil_texture,
+  chelsa_bio01_lgm = paths$chelsa_bio01_lgm, chelsa_bio12_lgm = paths$chelsa_bio12_lgm,
+  chelsa_bio15_lgm = paths$chelsa_bio15_lgm,
+  chelsa_bio01_modern = paths$chelsa_bio01_modern, chelsa_bio12_modern = paths$chelsa_bio12_modern,
   chelsa_bio15_modern = paths$chelsa_bio15_modern
 )
 
-# Load + reproject + crop each raster
-boundary <- st_read(paths$boundary, quiet = TRUE) %>%
-  st_transform(crs_utm44n)
-study_area_vect <- vect(st_union(boundary))
-
-# Reference raster — DEM at 250m for tractable prediction
-dem_ref <- rast(paths$dem) %>%
-  terra::project("EPSG:32644") %>%
-  crop(study_area_vect) %>%
-  mask(study_area_vect) %>%
-  aggregate(fact = 8)  # ~250m resolution for prediction
-
-message("Reference raster resolution: ", res(dem_ref)[1], "m")
-
-# Build raster stack
 raster_stack <- list()
 for (name in names(raster_vars)) {
   tryCatch({
-    r <- rast(raster_vars[[name]]) %>%
-      terra::project("EPSG:32644") %>%
-      crop(study_area_vect) %>%
-      mask(study_area_vect) %>%
-      resample(dem_ref, method = "bilinear")
+    r <- rast(raster_vars[[name]]) %>% terra::project("EPSG:32644") %>%
+      crop(study_area_vect) %>% mask(study_area_vect) %>% resample(dem_ref, method="bilinear")
     raster_stack[[name]] <- r
-    message("  Loaded: ", name)
-  }, error = function(e) {
-    message("  SKIP: ", name, " — ", e$message)
-  })
+  }, error = function(e) message("  SKIP: ", name, " - ", e$message))
 }
-
-# Convert stack to dataframe for prediction
-stack_rast <- rast(raster_stack)
-names(stack_rast) <- names(raster_stack)
-
+stack_rast <- rast(raster_stack); names(stack_rast) <- names(raster_stack)
 pred_df <- as.data.frame(stack_rast, na.rm = FALSE)
-message("Prediction grid: ", nrow(pred_df), " pixels")
 
-# Add missing structural variables with median values
-# (structural geology not available as continuous raster)
-for (sv in c("dist_fault", "dist_dyke", "dist_lineament",
-             "dist_shear", "dist_mineral", "burial_depth_m")) {
-  if (sv %in% analysis_vars) {
-    med_val <- median(model_imputed[[sv]], na.rm = TRUE)
-    pred_df[[sv]] <- med_val
-  }
-}
-
-# Impute NAs in prediction grid
-for (v in names(pred_df)) {
-  if (any(is.na(pred_df[[v]]))) {
-    pred_df[[v]][is.na(pred_df[[v]])] <-
-      median(pred_df[[v]], na.rm = TRUE)
-  }
-}
-
-# Keep only model variables
-pred_vars_available <- intersect(analysis_vars, names(pred_df))
+# structural + geochem vars have no continuous raster surface — fill median
+# (unchanged limitation from original; flagged explicitly)
 missing_vars <- setdiff(analysis_vars, names(pred_df))
-if (length(missing_vars) > 0) {
-  message("Missing vars for prediction (using median): ",
-          paste(missing_vars, collapse = ", "))
-  for (mv in missing_vars) {
-    pred_df[[mv]] <- median(model_imputed[[mv]], na.rm = TRUE)
-  }
+message("\nVariables filled with sample median for prediction surface (no raster",
+        " available): ", paste(missing_vars, collapse=", "))
+for (mv in missing_vars) pred_df[[mv]] <- median(model_imputed[[mv]], na.rm = TRUE)
+
+for (v in names(pred_df)) {
+  if (any(is.na(pred_df[[v]]))) pred_df[[v]][is.na(pred_df[[v]])] <- median(pred_df[[v]], na.rm=TRUE)
 }
 
 pred_input <- pred_df %>% select(all_of(analysis_vars))
-
-# Predict probability of "site"
-message("Predicting geoenvironmental attractiveness...")
 rf_probs <- predict(rf_model, pred_input, type = "prob")
 site_probs <- rf_probs[, "site"]
 
-# Map back to raster
-attract_vals <- rep(NA, nrow(as.data.frame(dem_ref, na.rm = FALSE)))
-non_na_idx <- which(!is.na(as.data.frame(dem_ref,
-                                         na.rm = FALSE)[, 1]))
-
-# Align predictions with non-NA pixels
-if (length(site_probs) == length(non_na_idx)) {
-  attract_vals[non_na_idx] <- site_probs
-} else {
-  attract_vals <- site_probs
-}
-
 attract_rast <- dem_ref
 values(attract_rast) <- site_probs
-
 attract_rast <- mask(attract_rast, study_area_vect)
+message("Suitability surface range: ", round(minmax(attract_rast)[1],3), " to ",
+        round(minmax(attract_rast)[2],3))
 
-message("Attractiveness surface range: ",
-        round(minmax(attract_rast)[1], 3), " to ",
-        round(minmax(attract_rast)[2], 3))
-
-# Save raster
-writeRaster(
-  attract_rast,
-  file.path(chapter_root, "08_PCA",
-            "geoenvironmental_attractiveness.tif"),
-  overwrite = TRUE
-)
-message("Attractiveness surface saved.")
-
-# -------------------------------------------------------------
-# Fig 11 — Simple base plot, no sf dependency
-# -------------------------------------------------------------
-
-message("Generating Fig11...")
-
-# Site coordinates directly from model_imputed
-sites_coords <- full_matrix %>%
-  filter(point_type == "site") %>%
-  select(point_id, period) %>%
-  left_join(
-    master_matrix %>% select(point_id, easting, northing),
-    by = "point_id"
-  ) %>%
-  filter(!is.na(easting), !is.na(northing))
-
-message("Site coords for plot: ", nrow(sites_coords))
-
-png(
-  file.path(chapter_root, "10_Figures",
-            "Fig11_Geoenvironmental_Attractiveness.png"),
-  width  = fig_width,
-  height = fig_height,
-  units  = "mm",
-  res    = fig_dpi
-)
-
-plot(attract_rast,
-     main = "Geoenvironmental Attractiveness Surface",
-     col  = viridis(100),
-     axes = TRUE)
-
-points(
-  x   = sites_coords$easting,
-  y   = sites_coords$northing,
-  pch = 16,
-  cex = 0.5,
-  col = "red"
-)
-
-dev.off()
-message("Fig11 saved: Geoenvironmental_Attractiveness.png")
+writeRaster(attract_rast, file.path(chapter_root, "08_PCA", "geoenvironmental_suitability.tif"),
+            overwrite = TRUE)
 
 
 # -------------------------------------------------------------
-# SECTION 12: Save All Outputs
+# Save All Outputs
 # -------------------------------------------------------------
 
 message("\nSaving outputs...")
 
-# PCA outputs
-write_csv(
-  pca_scores,
-  file.path(chapter_root, "08_PCA", "pca_scores.csv")
-)
-write_csv(
-  all_centroids,
-  file.path(chapter_root, "08_PCA", "period_centroids.csv")
-)
-write_csv(
-  displacements,
-  file.path(chapter_root, "08_PCA",
-            "centroid_displacement_vectors.csv")
-)
-write_csv(
-  as.data.frame(eig_vals) %>% rownames_to_column("PC"),
-  file.path(chapter_root, "08_PCA", "pca_eigenvalues.csv")
-)
-message("Saved: PCA outputs")
+write_csv(pcoa_scores, file.path(chapter_root, "08_PCA", "pcoa_scores.csv"))
+write_csv(period_centroids, file.path(chapter_root, "08_PCA", "period_centroids.csv"))
+write_csv(displacements, file.path(chapter_root, "08_PCA", "centroid_displacement_vectors_bootstrapCI.csv"))
+write_csv(tibble(axis = paste0("PCoA",seq_along(var_explained)), variance_pct = var_explained),
+          file.path(chapter_root, "08_PCA", "pcoa_variance_explained.csv"))
 
-# RF outputs
-write_csv(
-  importance_df,
-  file.path(chapter_root, "09_RandomForest",
-            "rf_variable_importance.csv")
-)
-write_csv(
-  importance_df %>% head(15),
-  file.path(chapter_root, "11_Tables",
-            "Table_03_RF_Variable_Importance.csv")
-)
-message("Saved: RF variable importance")
+write_csv(importance_df, file.path(chapter_root, "09_RandomForest", "rf_variable_importance.csv"))
+write_csv(importance_df %>% head(15), file.path(chapter_root, "11_Tables", "Table_03_RF_Variable_Importance.csv"))
+write_csv(grp_importance, file.path(chapter_root, "09_RandomForest", "rf_grouped_importance.csv"))
+write_csv(validation_comparison, file.path(chapter_root, "11_Tables", "Table_RF_validation_comparison.csv"))
+write_csv(lgm_comparison, file.path(chapter_root, "09_RandomForest", "chelsa_lgm_sensitivity.csv"))
+write_csv(displacements, file.path(chapter_root, "11_Tables", "Table_04_Centroid_Displacements.csv"))
 
-# Displacement table
-write_csv(
-  displacements,
-  file.path(chapter_root, "11_Tables",
-            "Table_04_Centroid_Displacements.csv")
-)
-message("Saved: Table_04_Centroid_Displacements.csv")
-
-# RData
-save(
-  pca_result,
-  pca_scores,
-  period_centroids,
-  all_centroids,
-  displacements,
-  rf_model,
-  importance_df,
-  attract_rast,
-  file = file.path(chapter_root, "09_RandomForest",
-                   "pca_rf_results.RData")
-)
-message("Saved: pca_rf_results.RData")
+save(pcoa_result, pcoa_scores, period_centroids, displacements, gower_dist,
+     rf_model, rf_model_no_lgm, importance_df, grp_importance,
+     validation_comparison, lgm_comparison, spatial_cv_preds, spatial_cv_auc,
+     attract_rast,
+     file = file.path(chapter_root, "09_RandomForest", "pcoa_rf_results.RData"))
+message("Saved: all PCoA/RF outputs")
 
 
 # -------------------------------------------------------------
-# SECTION 13: Final Summary
+# Log + Final Summary
 # -------------------------------------------------------------
 
-message("\n=== FINAL ANALYTICAL SUMMARY ===")
-
-message("\nPCA:")
-message("  PC1 variance: ", round(eig_vals[1, "variance.percent"], 1), "%")
-message("  PC2 variance: ", round(eig_vals[2, "variance.percent"], 1), "%")
-message("  PC1+PC2 total: ",
-        round(sum(eig_vals[1:2, "variance.percent"]), 1), "%")
-
-message("\nPeriod centroids (PC1, PC2):")
-for (i in 1:nrow(period_centroids)) {
-  message("  ", period_centroids$period[i], ": (",
-          round(period_centroids$PC1_mean[i], 3), ", ",
-          round(period_centroids$PC2_mean[i], 3), ")")
-}
-
-message("\nDiachronic displacements:")
-message("  LP → MP: ", round(disp_lp_mp, 3), " PC units")
-message("  MP → UP: ", round(disp_mp_up, 3), " PC units")
-
-message("\nRandom Forest:")
-message("  OOB accuracy: ",
-        round((1 - rf_model$err.rate[rf_ntree, "OOB"]) * 100, 1), "%")
-message("  Top variable: ", importance_df$variable[1])
-message("  Top category: ", importance_df$category[1])
-
-
-# -------------------------------------------------------------
-# SECTION 14: Log Session
-# -------------------------------------------------------------
-
-log_file <- file.path(chapter_root, "13_Logs",
-                      paste0("script07_log_", Sys.Date(), ".txt"))
+log_file <- file.path(chapter_root, "13_Logs", paste0("script07_log_", Sys.Date(), ".txt"))
 sink(log_file)
-cat("SCRIPT 07 LOG — PCA + Random Forest\n")
+cat("SCRIPT 07 LOG (REBUILT) — PCoA + Random Forest\n")
 cat("Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
-cat("PCA — PC1 variance:", round(eig_vals[1, "variance.percent"], 1), "%\n")
-cat("PCA — PC2 variance:", round(eig_vals[2, "variance.percent"], 1), "%\n")
-cat("\nPeriod centroids:\n")
-print(all_centroids)
-cat("\nDisplacement vectors:\n")
-print(displacements)
-cat("\nRF OOB accuracy:",
-    round((1 - rf_model$err.rate[rf_ntree, "OOB"]) * 100, 1), "%\n")
-cat("\nTop 15 variable importance:\n")
-print(importance_df %>% head(15) %>%
-        select(rank, variable, MeanDecreaseGini, category))
+cat("PCoA variance (axis 1-2):", round(sum(head(var_explained,2)),1), "%\n")
+cat("Centroid displacements + bootstrap CI:\n"); print(displacements)
+cat("\nNaive OOB:", oob_acc, "% | Spatial Block CV:", round(100*spatial_cv_acc,1),
+    "% | AUC:", round(spatial_cv_auc,3), "\n")
+cat("\nTop 15 permutation importance:\n")
+print(importance_df %>% head(15) %>% select(rank, variable, MeanDecreaseAccuracy, category))
+cat("\nGrouped importance:\n"); print(grp_importance)
+cat("\nCHELSA-LGM sensitivity (with vs without OOB):", oob_acc, "vs", oob_acc_no_lgm, "\n")
 sink()
-
 message("Log saved: ", log_file)
 
-
-# -------------------------------------------------------------
-# SCRIPT 07 COMPLETE
-# -------------------------------------------------------------
-
 message("\n=============================================================")
-message("Script 07 complete. All analyses done.")
-message("PCA biplot:           Fig08")
-message("RF importance:        Fig09")
-message("Attractiveness surface: Fig11")
-message("Next: Run Script 08 — Final Figures Production")
+message("Script 07 (REBUILT) complete.")
+message("PCoA (Gower, mixed types) replaces invalid Euclidean PCA.")
+message("RF: naive OOB=", oob_acc, "% | spatial block CV=", round(100*spatial_cv_acc,1),
+        "% | AUC=", round(spatial_cv_auc,3))
+message("Primary importance metric: permutation (MeanDecreaseAccuracy), +grouped importance")
+message("CHELSA-LGM sensitivity checked: with=", oob_acc, "% without=", oob_acc_no_lgm, "%")
+message("Next: Script 08 — Publication Figures (rebuild all from corrected outputs)")
 message("=============================================================")

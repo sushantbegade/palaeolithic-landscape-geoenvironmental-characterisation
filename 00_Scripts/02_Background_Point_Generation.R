@@ -1,24 +1,31 @@
 # =============================================================
-# SCRIPT 02: Background Point Generation
+# SCRIPT 02 (REBUILT): Background Point Generation
 # =============================================================
 # Project: Reading the Palaeolithic Landscape
 # Chapter: Mapping the Past (Springer Nature, 2026)
 # Author: Sushant Begade | RTMNU Nagpur
 # ORCID: 0009-0003-0804-1763
-# Date: August 2026
+# Rebuild date: August 2026
 # =============================================================
-# PURPOSE: Generate 1000 spatially filtered pseudo-absence
-# background points across the study area extent.
-# Spatial filtering ensures minimum 2km separation between
-# background points to avoid spatial autocorrelation.
-# Points constrained within district boundary.
-# Save outputs for use in all extraction scripts.
+# CHANGES FROM ORIGINAL SCRIPT 02:
+#   1. TWO parallel background samples generated instead of one:
+#      (a) background_uniform  — original method, random across
+#          full district boundary (~22,000 km2). Represents
+#          "landscape availability."
+#      (b) background_envelope — NEW. Constrained to a buffered
+#          convex hull around known site locations. Represents
+#          "surveyed landscape only." Directly tests whether RF/MW
+#          results in Script 06/07 depend on background extent
+#          (i.e. survey-effort bias, reviewer critical problem #4).
+#   2. Both use min_dist_bg = 2000m spatial thinning, same seed.
+#   3. period now pulled from rebuilt Script 01 output — LP/MP/UP
+#      counts are 48/62/27 (n=137 single-period), MULTI (n=60)
+#      carried as separate category, NOT used for MW/PCA/RF period
+#      stratification but included in combined_pts for Fig 1 /
+#      descriptive stats and for the new Persistent-Places check.
+#   4. coord_precision carried through into sites_minimal so it's
+#      available in every downstream matrix without re-joining.
 # =============================================================
-
-
-# -------------------------------------------------------------
-# SECTION 1: Load Global Parameters + Validated Sites
-# -------------------------------------------------------------
 
 load("E:/Projects & Researches/Nagpur-Chandrapur Enhanced Dataset/Reading_the_Palaeolithic_Landscape_Chapter/00_Scripts/global_params.RData")
 
@@ -33,274 +40,245 @@ set.seed(rf_seed)
 
 message("Parameters and site data loaded.")
 message("Sites loaded: ", nrow(sites_utm))
+message("Period breakdown: LP=48 MP=62 UP=27 MULTI=60 (see Script 01 log)")
 
 
 # -------------------------------------------------------------
-# SECTION 2: Prepare Study Area Mask
+# SECTION 2: Prepare Study Area Mask (full boundary)
 # -------------------------------------------------------------
 
-message("\nPreparing study area mask...")
-
-# Union district boundary — single polygon
-study_area <- st_union(boundary) %>%
-  st_as_sf()
-
-# Confirm CRS
-message("Study area CRS: ", st_crs(study_area)$input)
-message("Study area approx. bbox:")
-print(st_bbox(study_area))
-
-# Convert to terra SpatVector for raster masking
+study_area <- st_union(boundary) %>% st_as_sf()
 study_area_vect <- vect(study_area)
 
+message("\nFull study area (uniform bg universe):")
+print(st_bbox(study_area))
+
 
 # -------------------------------------------------------------
-# SECTION 3: Load Reference Raster for Spatial Grid
+# SECTION 2b: Survey-Envelope Polygon  [NEW, FIXED v2]
 # -------------------------------------------------------------
+# Rationale: uniform-random background across the FULL 22,000 km2
+# boundary compares sites against landscape that was never
+# meaningfully surveyed for Palaeolithic remains. That confounds
+# "environmental preference" with "where archaeologists looked."
+#
+# v1 BUG: convex hull of all 197 sites + 5km buffer covered 84% of
+# the full boundary — a hull bridges straight over unsurveyed
+# interior/ridge terrain lying between site clusters (sites cluster
+# along valleys, not across the whole district), so it barely
+# restricts anything and the sensitivity check is close to useless.
+#
+# FIX: union of small buffers around EACH individual site instead
+# of one hull. No bridging — only actual site vicinities count as
+# "surveyed." envelope_buffer_m set well under the mean nearest-
+# neighbour site spacing (~8.6km per Script 02 uniform-bg check)
+# so buffers mostly stay disjoint rather than re-merging into one
+# blob. ADJUST if you have real survey transect/block polygons —
+# use those instead of this proxy if they exist. Flag as
+# approximation in Methods regardless.
 
-message("\nLoading reference raster (DEM)...")
+envelope_buffer_m <- 3000  # 3 km buffer around EACH site, then dissolved
+
+survey_envelope <- sites_utm %>%
+  st_buffer(dist = envelope_buffer_m) %>%
+  st_union() %>%
+  st_intersection(study_area) %>%
+  st_as_sf()
+
+envelope_area_km2   <- as.numeric(st_area(survey_envelope)) / 1e6
+full_area_km2        <- as.numeric(st_area(study_area)) / 1e6
+
+message("\nSurvey-envelope polygon created (", envelope_buffer_m/1000,
+        "km buffer around each site, dissolved).")
+message("Envelope area: ", round(envelope_area_km2, 0), " km2")
+message("Full boundary area: ", round(full_area_km2, 0), " km2")
+message("Envelope = ", round(100 * envelope_area_km2 / full_area_km2, 1),
+        "% of full study area.")
+if ((envelope_area_km2 / full_area_km2) > 0.5) {
+  message("WARNING: envelope still >50% of full area — site buffers are")
+  message("merging extensively. Consider reducing envelope_buffer_m further")
+  message("or check for tight site clustering inflating union size.")
+}
+
+envelope_vect <- vect(survey_envelope)
+
+
+# -------------------------------------------------------------
+# SECTION 3: Reference Raster for Spatial Grid
+# -------------------------------------------------------------
 
 dem <- rast(paths$dem)
-
-# Force terra::project to avoid masking conflict
 dem <- terra::project(dem, "EPSG:32644")
-
-# Crop + mask to study area
-dem_masked <- dem %>%
-  crop(study_area_vect) %>%
-  mask(study_area_vect)
-
-message("DEM loaded and masked.")
-message("Resolution: ", res(dem_masked)[1], " m")
-message("Extent: ", paste(round(ext(dem_masked)[1:4], 0), collapse = ", "))
+dem_masked <- dem %>% crop(study_area_vect) %>% mask(study_area_vect)
+message("\nDEM loaded and masked. Resolution: ", res(dem_masked)[1], " m")
 
 
 # -------------------------------------------------------------
-# SECTION 4: Generate Candidate Random Points
+# SECTION 4: Helper — Generate + Spatially Thin Background Set
 # -------------------------------------------------------------
 
-message("\nGenerating candidate background points...")
-
-# Generate large pool — will filter down to n_background
-# Oversample by 10x to ensure enough survive spatial filtering
-n_candidate <- n_background * 10
-
-# Sample random points within study area boundary
-candidates <- st_sample(
-  study_area,
-  size = n_candidate,
-  type = "random"
-) %>%
-  st_as_sf() %>%
-  st_set_crs(crs_utm44n)
-
-message("Candidate points generated: ", nrow(candidates))
-
-
-# -------------------------------------------------------------
-# SECTION 5: Spatial Filtering — Minimum Distance Between Points
-# -------------------------------------------------------------
-
-message("\nApplying spatial filter (min ", min_dist_bg, "m between points)...")
-
-# Convert to matrix for distance filtering
-coords_mat <- st_coordinates(candidates)
-
-# Sequential spatial thinning
-selected_idx <- c(1)  # Always keep first point
-
-for (i in 2:nrow(candidates)) {
-  # Calculate distances from candidate i to all already-selected points
-  dists <- sqrt(
-    (coords_mat[i, 1] - coords_mat[selected_idx, 1])^2 +
-      (coords_mat[i, 2] - coords_mat[selected_idx, 2])^2
-  )
-  # Keep point only if minimum distance exceeded
-  if (min(dists) >= min_dist_bg) {
-    selected_idx <- c(selected_idx, i)
+generate_background <- function(sampling_polygon, n_target, min_dist,
+                                label, seed_val) {
+  
+  set.seed(seed_val)
+  n_candidate <- n_target * 10
+  
+  message("\n--- Generating background: ", label, " ---")
+  candidates <- st_sample(sampling_polygon, size = n_candidate, type = "random") %>%
+    st_as_sf() %>% st_set_crs(crs_utm44n)
+  message("  Candidates generated: ", nrow(candidates))
+  
+  coords_mat <- st_coordinates(candidates)
+  selected_idx <- c(1)
+  for (i in 2:nrow(candidates)) {
+    dists <- sqrt((coords_mat[i, 1] - coords_mat[selected_idx, 1])^2 +
+                    (coords_mat[i, 2] - coords_mat[selected_idx, 2])^2)
+    if (min(dists) >= min_dist) selected_idx <- c(selected_idx, i)
+    if (length(selected_idx) >= n_target) break
   }
-  # Stop once we have enough
-  if (length(selected_idx) >= n_background) break
+  
+  pts <- candidates[selected_idx, ]
+  message("  After ", min_dist, "m spatial thinning: ", nrow(pts))
+  
+  if (nrow(pts) < n_target) {
+    warning("  Only ", nrow(pts), " points survived thinning for '", label,
+            "'. Consider larger n_candidate or smaller min_dist.")
+  } else {
+    pts <- pts[1:n_target, ]
+  }
+  
+  within_check <- st_within(pts, study_area, sparse = FALSE)
+  n_outside <- sum(!within_check)
+  if (n_outside > 0) {
+    message("  Removing ", n_outside, " points outside district boundary...")
+    pts <- pts[as.vector(within_check), ]
+  }
+  
+  pts <- pts %>%
+    mutate(
+      point_id     = paste0("BG_", toupper(substr(label,1,3)), "_", sprintf("%04d", 1:n())),
+      point_type   = "background",
+      period       = "background",
+      bg_source    = label
+    )
+  bg_coords <- st_coordinates(pts)
+  pts <- pts %>% mutate(easting = bg_coords[,1], northing = bg_coords[,2])
+  
+  message("  Final ", label, " background points: ", nrow(pts))
+  return(pts)
 }
 
-background_pts <- candidates[selected_idx, ]
 
-message("Background points after spatial filtering: ", nrow(background_pts))
+# -------------------------------------------------------------
+# SECTION 5: Generate BOTH Background Sets
+# -------------------------------------------------------------
 
-# Check if we have enough
-if (nrow(background_pts) < n_background) {
-  warning("Only ", nrow(background_pts), " points generated after filtering.",
-          " Consider reducing min_dist_bg or increasing n_candidate.")
-} else {
-  message("Target of ", n_background, " background points achieved.")
-  # Trim to exactly n_background
-  background_pts <- background_pts[1:n_background, ]
-}
+background_uniform <- generate_background(
+  sampling_polygon = study_area,
+  n_target  = n_background,
+  min_dist  = min_dist_bg,
+  label     = "uniform",
+  seed_val  = rf_seed
+)
+
+background_envelope <- generate_background(
+  sampling_polygon = survey_envelope,
+  n_target  = n_background,
+  min_dist  = min_dist_bg,
+  label     = "envelope",
+  seed_val  = rf_seed + 1   # different seed, same method, avoid identical draw
+)
 
 
 # -------------------------------------------------------------
-# SECTION 6: Confirm All Points Within Boundary
+# SECTION 6: Site Metadata (carry coord_precision + period_multi)
 # -------------------------------------------------------------
 
-message("\nValidating background points within boundary...")
-
-within_check <- st_within(background_pts, study_area, sparse = FALSE)
-n_outside <- sum(!within_check)
-message("Points outside boundary: ", n_outside)
-
-# Remove any outside (should be zero)
-background_pts <- background_pts[as.vector(within_check), ]
-message("Final background points: ", nrow(background_pts))
-
-
-# -------------------------------------------------------------
-# SECTION 7: Add Metadata Columns
-# -------------------------------------------------------------
-
-background_pts <- background_pts %>%
-  mutate(
-    point_id   = paste0("BG_", sprintf("%04d", 1:n())),
-    point_type = "background",
-    period     = "background"
-  )
-
-# Extract coordinates as columns
-bg_coords <- st_coordinates(background_pts)
-background_pts <- background_pts %>%
-  mutate(
-    easting  = bg_coords[, 1],
-    northing = bg_coords[, 2]
-  )
-
-message("\nBackground point metadata added.")
-
-
-# -------------------------------------------------------------
-# SECTION 8: Add Site Point Metadata for Combined Dataset
-# -------------------------------------------------------------
-
-message("\nPreparing combined site + background dataset...")
-
-# Add coordinates to site points
 site_coords <- st_coordinates(sites_utm)
 
-# Build minimal site dataframe — avoid geometry conflict
 sites_minimal <- data.frame(
-  point_id   = paste0("SITE_", sprintf("%03d", sites_utm$site_id)),
-  point_type = "site",
-  period     = sites_utm$period,
-  easting    = site_coords[, 1],
-  northing   = site_coords[, 2]
+  point_id        = paste0("SITE_", sprintf("%03d", sites_utm$site_id)),
+  point_type      = "site",
+  period          = as.character(sites_utm$period),      # LP/MP/UP/MULTI
+  coord_precision = as.character(sites_utm$coord_precision),
+  easting         = site_coords[, 1],
+  northing        = site_coords[, 2]
 )
 
-# Build minimal background dataframe
-background_minimal <- data.frame(
-  point_id   = background_pts$point_id,
-  point_type = "background",
-  period     = "background",
-  easting    = background_pts$easting,
-  northing   = background_pts$northing
-)
-
-# Combine — plain dataframe, no geometry conflict
-combined_pts <- bind_rows(sites_minimal, background_minimal)
-
-message("Combined dataset: ", nrow(combined_pts), " points")
-message("  Sites: ", sum(combined_pts$point_type == "site"))
-message("  Background: ", sum(combined_pts$point_type == "background"))
+message("\nSite records prepared: ", nrow(sites_minimal))
+message("  By period: "); print(table(sites_minimal$period))
 
 
 # -------------------------------------------------------------
-# SECTION 9: Minimum Distance Check — Sites vs Background
+# SECTION 7: Combined Datasets (one per background variant)
 # -------------------------------------------------------------
 
-message("\nChecking minimum distance between sites and background points...")
+bg_uniform_minimal <- background_uniform %>%
+  st_drop_geometry() %>%
+  transmute(point_id, point_type, period,
+            coord_precision = NA_character_, easting, northing, bg_source = "uniform")
 
-site_coords_mat <- site_coords        # already computed in Section 8
-bg_coords_mat   <- as.matrix(
-  background_pts %>% st_drop_geometry() %>% select(easting, northing)
-)
+bg_envelope_minimal <- background_envelope %>%
+  st_drop_geometry() %>%
+  transmute(point_id, point_type, period,
+            coord_precision = NA_character_, easting, northing, bg_source = "envelope")
 
-min_dists_to_sites <- apply(bg_coords_mat, 1, function(bg) {
-  min(sqrt(
-    (bg[1] - site_coords_mat[, 1])^2 +
-      (bg[2] - site_coords_mat[, 2])^2
-  ))
-})
+sites_minimal <- sites_minimal %>% mutate(bg_source = NA_character_)
 
-message("Background points < 1km from any site: ",
-        sum(min_dists_to_sites < 1000))
-message("Min distance (bg to nearest site): ",
-        round(min(min_dists_to_sites), 0), " m")
-message("Mean distance (bg to nearest site): ",
-        round(mean(min_dists_to_sites), 0), " m")
+combined_uniform  <- bind_rows(sites_minimal, bg_uniform_minimal)
+combined_envelope <- bind_rows(sites_minimal, bg_envelope_minimal)
+
+message("\nCombined UNIFORM dataset: ", nrow(combined_uniform), " points")
+message("Combined ENVELOPE dataset: ", nrow(combined_envelope), " points")
 
 
 # -------------------------------------------------------------
-# SECTION 10: Summary Statistics
+# SECTION 8: Minimum Distance Checks (both variants)
 # -------------------------------------------------------------
 
-message("\n=== BACKGROUND POINT SUMMARY ===")
-message("Total background points: ", nrow(background_pts))
-message("Spatial filter applied: ", min_dist_bg, " m minimum separation")
-message("Seed used: ", rf_seed)
-message("Points within boundary: ", nrow(background_pts))
-message("\nSpatial extent of background points:")
-print(st_bbox(background_pts))
+check_min_dist <- function(bg_sf, site_coords_mat, label) {
+  bg_mat <- st_coordinates(bg_sf)
+  min_d <- apply(bg_mat, 1, function(bg) {
+    min(sqrt((bg[1] - site_coords_mat[,1])^2 + (bg[2] - site_coords_mat[,2])^2))
+  })
+  message("\n[", label, "] bg points <1km from any site: ", sum(min_d < 1000))
+  message("[", label, "] min dist to nearest site: ", round(min(min_d), 0), " m")
+  message("[", label, "] mean dist to nearest site: ", round(mean(min_d), 0), " m")
+}
+
+check_min_dist(background_uniform,  site_coords, "uniform")
+check_min_dist(background_envelope, site_coords, "envelope")
 
 
 # -------------------------------------------------------------
-# SECTION 11: Save Outputs
+# SECTION 9: Save Outputs
 # -------------------------------------------------------------
-
-message("\nSaving outputs...")
 
 out_path <- file.path(chapter_root, "02_Background_Points")
 
-# 1. Background points shapefile — UTM 44N
-st_write(
-  background_pts,
-  file.path(out_path, "background_pts_utm44n.shp"),
-  delete_layer = TRUE,
-  quiet = TRUE
-)
-message("Saved: background_pts_utm44n.shp")
+st_write(background_uniform,
+         file.path(out_path, "background_uniform_utm44n.shp"),
+         delete_layer = TRUE, quiet = TRUE)
+st_write(background_envelope,
+         file.path(out_path, "background_envelope_utm44n.shp"),
+         delete_layer = TRUE, quiet = TRUE)
+message("\nSaved: background_uniform_utm44n.shp, background_envelope_utm44n.shp")
 
-# 2. Background points — WGS84
-background_wgs84 <- st_transform(background_pts, crs = crs_wgs84)
-st_write(
-  background_wgs84,
-  file.path(out_path, "background_pts_wgs84.shp"),
-  delete_layer = TRUE,
-  quiet = TRUE
-)
-message("Saved: background_pts_wgs84.shp")
+st_write(survey_envelope,
+         file.path(out_path, "survey_envelope_polygon.shp"),
+         delete_layer = TRUE, quiet = TRUE)
+message("Saved: survey_envelope_polygon.shp  [cite in Methods / Fig 1 inset]")
 
-# 3. Combined site + background CSV
-write_csv(
-  combined_pts,
-  file.path(out_path, "combined_sites_background.csv")
-)
-message("Saved: combined_sites_background.csv")
+write_csv(combined_uniform,  file.path(out_path, "combined_sites_background_uniform.csv"))
+write_csv(combined_envelope, file.path(out_path, "combined_sites_background_envelope.csv"))
+message("Saved: combined_sites_background_uniform.csv, combined_sites_background_envelope.csv")
 
-# RData
 save(
-  background_pts,
-  background_wgs84,
-  combined_pts,
-  study_area,
-  study_area_vect,
-  dem_masked,
-  file = file.path(out_path, "background_pts.RData")
-)
-
-# 4. RData for subsequent scripts
-save(
-  background_pts,
-  background_wgs84,
-  combined_pts,
-  study_area,
-  study_area_vect,
+  background_uniform, background_envelope,
+  combined_uniform, combined_envelope,
+  study_area, study_area_vect,
+  survey_envelope, envelope_vect,
+  envelope_area_km2, full_area_km2,
   dem_masked,
   file = file.path(out_path, "background_pts.RData")
 )
@@ -308,55 +286,45 @@ message("Saved: background_pts.RData")
 
 
 # -------------------------------------------------------------
-# SECTION 12: Quick Visual Check
+# SECTION 10: QC Plot — Both Variants Side by Side
 # -------------------------------------------------------------
-
-message("\nGenerating quick validation plot...")
 
 fig_path <- file.path(chapter_root, "10_Figures")
 
-png(
-  file.path(fig_path, "QC_background_points_distribution.png"),
-  width  = fig_width,
-  height = fig_height,
-  units  = "mm",
-  res    = fig_dpi
-)
+png(file.path(fig_path, "QC_background_uniform_vs_envelope.png"),
+    width = fig_width * 2, height = fig_height, units = "mm", res = fig_dpi)
+par(mfrow = c(1, 2))
 
 plot(st_geometry(study_area), col = "grey95", border = "grey40",
-     main = "Background Points + Site Locations",
-     sub  = paste0("Background n=", nrow(background_pts),
-                   " | Sites n=", nrow(sites_utm)))
-plot(st_geometry(background_pts), add = TRUE,
-     pch = 16, cex = 0.3, col = "steelblue")
-plot(st_geometry(sites_utm), add = TRUE,
-     pch = 17, cex = 0.6, col = "red")
-legend("bottomright",
-       legend = c("Background", "Palaeolithic Sites"),
-       pch    = c(16, 17),
-       col    = c("steelblue", "red"),
-       cex    = 0.7)
+     main = "Uniform background", sub = paste0("n=", nrow(background_uniform)))
+plot(st_geometry(background_uniform), add = TRUE, pch = 16, cex = 0.3, col = "steelblue")
+plot(st_geometry(sites_utm), add = TRUE, pch = 17, cex = 0.5, col = "red")
+
+plot(st_geometry(study_area), col = "grey95", border = "grey40",
+     main = "Envelope background", sub = paste0("n=", nrow(background_envelope)))
+plot(st_geometry(survey_envelope), add = TRUE, border = "darkorange", lwd = 1.5, col = NA)
+plot(st_geometry(background_envelope), add = TRUE, pch = 16, cex = 0.3, col = "steelblue")
+plot(st_geometry(sites_utm), add = TRUE, pch = 17, cex = 0.5, col = "red")
 
 dev.off()
-message("QC plot saved.")
+message("\nQC comparison plot saved.")
 
 
 # -------------------------------------------------------------
-# SECTION 13: Log Session
+# SECTION 11: Log Session
 # -------------------------------------------------------------
 
 log_file <- file.path(chapter_root, "13_Logs",
                       paste0("script02_log_", Sys.Date(), ".txt"))
 sink(log_file)
-cat("SCRIPT 02 LOG — Background Point Generation\n")
+cat("SCRIPT 02 LOG (REBUILT) — Background Point Generation\n")
 cat("Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
-cat("Seed:", rf_seed, "\n")
-cat("Target background points:", n_background, "\n")
-cat("Min separation distance:", min_dist_bg, "m\n")
-cat("Final background points:", nrow(background_pts), "\n")
-cat("Total combined dataset:", nrow(combined_pts), "\n")
+cat("Uniform background: n=", nrow(background_uniform), "\n")
+cat("Envelope background: n=", nrow(background_envelope), "\n")
+cat("Survey envelope area:", round(envelope_area_km2,0), "km2 (",
+    round(100*envelope_area_km2/full_area_km2,1), "% of full boundary)\n")
+cat("Envelope buffer distance:", envelope_buffer_m, "m around each site (dissolved)\n")
 sink()
-
 message("Log saved: ", log_file)
 
 
@@ -365,9 +333,15 @@ message("Log saved: ", log_file)
 # -------------------------------------------------------------
 
 message("\n=============================================================")
-message("Script 02 complete.")
-message("Background points generated: ", nrow(background_pts))
-message("Combined dataset: ", nrow(combined_pts), " points")
-message("Outputs saved to: ", out_path)
-message("Next: Run Script 03 — Raster Variable Extraction")
+message("Script 02 (REBUILT) complete.")
+message("TWO background sets now exist: uniform (n=", nrow(background_uniform),
+        ") + envelope (n=", nrow(background_envelope), ")")
+message("Envelope covers ", round(100*envelope_area_km2/full_area_km2,1),
+        "% of full study area.")
+message("Scripts 03-07 must now run TWICE (once per bg variant) OR run once")
+message("on uniform (primary) + envelope as a Discussion sensitivity check —")
+message("decide before Script 03. Recommend: uniform = primary throughout,")
+message("envelope = rerun of Script 06/07 ONLY, reported as robustness check.")
+message("Next: Script 03 — Raster Variable Extraction")
+message("  (fix background matrix numeric type bug + CHELSA-LGM handling)")
 message("=============================================================")

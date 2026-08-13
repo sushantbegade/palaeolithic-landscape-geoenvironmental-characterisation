@@ -1,30 +1,36 @@
 # =============================================================
-# SCRIPT 03: Raster Variable Extraction
+# SCRIPT 03 (REBUILT): Raster Variable Extraction
 # =============================================================
 # Project: Reading the Palaeolithic Landscape
 # Chapter: Mapping the Past (Springer Nature, 2026)
 # Author: Sushant Begade | RTMNU Nagpur
 # ORCID: 0009-0003-0804-1763
-# Date: August 2026
+# Rebuild date: August 2026
 # =============================================================
-# PURPOSE: Extract all raster variable values at 197 site
-# points and 1000 background points. Covers:
-# - Sentinel-2A bands (B01-B12, B8A)
-# - Sentinel-2A derived indices (NDVI, NDWI, MNDWI, NDBI,
-#   BSI, SAVI, MSAVI)
-# - Soil properties (Depth, Erosion, Productivity,
-#   Slope, Texture)
-# - DEM
-# - CHELSA modern climate (bio01, bio12, bio15)
-# - CHELSA TraCE21k palaeoclimate (bio01, bio12, bio15)
-# - WorldClim (bio01, bio12, bio15)
-# Output: master extraction matrix for all analyses.
+# CHANGES FROM ORIGINAL SCRIPT 03:
+#   1. Extracts from combined_uniform (Script 02 output) instead of
+#      rebuilding site/bg dataframes from scratch — carries
+#      coord_precision, period (LP/MP/UP/MULTI), bg_source through
+#      into master_matrix. Original script dropped these silently.
+#   2. NUMERIC COERCION AUDIT [fixes reported bug]: every extracted
+#      raster column is forced to numeric with as.numeric(), and any
+#      values that fail to coerce (become NA that weren't NA before)
+#      are counted and printed per column so the root cause is
+#      actually visible instead of silently producing a String-typed
+#      CSV column downstream. Original background_extraction_matrix.csv
+#      had soil_depth/soil_erosion/soil_productivity/soil_slope/
+#      soil_texture/chelsa_*/wc_* as String type while the sites
+#      matrix had them as Float — this audit will show why.
+#   3. PRIMARY RUN = uniform background only (n=1000). Envelope
+#      background (n=728, Script 02) is NOT extracted here — deferred
+#      to the Script 06/07 sensitivity pass to avoid double raster IO
+#      now. extract_matrix() below is written as a reusable function
+#      so that pass just calls it again on combined_envelope later.
+#   4. CHELSA-LGM extracted here as before (extraction itself is
+#      valid at all points) — the temporal-validity restriction for
+#      LP/MP (Script 06 discussion) is an ANALYSIS decision, not an
+#      extraction decision, so it stays in Script 06, not here.
 # =============================================================
-
-
-# -------------------------------------------------------------
-# SECTION 1: Load Global Parameters + Data
-# -------------------------------------------------------------
 
 load("E:/Projects & Researches/Nagpur-Chandrapur Enhanced Dataset/Reading_the_Palaeolithic_Landscape_Chapter/00_Scripts/global_params.RData")
 
@@ -38,92 +44,39 @@ library(tidyverse)
 set.seed(rf_seed)
 
 message("Parameters and data loaded.")
-message("Sites: ", nrow(sites_utm))
-message("Background points: ", nrow(background_pts))
+message("combined_uniform: ", nrow(combined_uniform), " points")
 
 
 # -------------------------------------------------------------
-# SECTION 2: Prepare Extraction Points
+# SECTION 2: SpatVector from combined_uniform (PRIMARY dataset)
 # -------------------------------------------------------------
 
-message("\nPreparing extraction points...")
+all_pts_df <- combined_uniform  # point_id, point_type, period,
+# coord_precision, easting, northing, bg_source
 
-# Inspect what columns are available
-message("Sites columns: ", paste(names(sites_utm), collapse = ", "))
-message("Background columns: ", paste(names(background_pts), collapse = ", "))
-
-# Build site extraction dataframe from available columns
-site_coords <- st_coordinates(sites_utm)
-
-sites_extract <- data.frame(
-  point_id   = paste0("SITE_", sprintf("%03d", sites_utm$site_id)),
-  point_type = "site",
-  period     = sites_utm$period,
-  easting    = site_coords[, 1],
-  northing   = site_coords[, 2]
-)
-
-# Build background extraction dataframe
-bg_coords <- st_coordinates(background_pts)
-
-bg_extract <- data.frame(
-  point_id   = paste0("BG_", sprintf("%04d", 1:nrow(background_pts))),
-  point_type = "background",
-  period     = "background",
-  easting    = bg_coords[, 1],
-  northing   = bg_coords[, 2]
-)
-
-# Combined
-all_pts_sf <- bind_rows(sites_extract, bg_extract)
-
-message("Sites prepared: ",     nrow(sites_extract))
-message("Background prepared: ", nrow(bg_extract))
-message("Total points: ",        nrow(all_pts_sf))
-
-# Convert to SpatVector for terra extraction
-all_vect <- vect(
-  all_pts_sf,
-  geom = c("easting", "northing"),
-  crs  = crs_utm44n
-)
-
-# Also keep site and background vects separately
-sites_vect     <- vect(sites_extract,
-                       geom = c("easting", "northing"),
-                       crs  = crs_utm44n)
-background_vect <- vect(bg_extract,
-                        geom = c("easting", "northing"),
-                        crs  = crs_utm44n)
-
-message("SpatVectors created.")
+all_vect <- vect(all_pts_df, geom = c("easting", "northing"), crs = crs_utm44n)
+message("SpatVector created: ", nrow(all_vect), " points")
 
 
 # -------------------------------------------------------------
-# SECTION 3: Helper Function — Safe Raster Extract
+# SECTION 3: Helper — Safe Raster Extract (unchanged logic)
 # -------------------------------------------------------------
 
-safe_extract <- function(raster_path, points_vect,
-                         var_names, reproject = TRUE) {
+safe_extract <- function(raster_path, points_vect, var_names, reproject = TRUE) {
   tryCatch({
     r <- rast(raster_path)
-    if (reproject) {
-      r <- terra::project(r, crs_utm44n)
-    }
+    if (reproject) r <- terra::project(r, crs_utm44n)
     vals <- terra::extract(r, points_vect, ID = FALSE)
     if (ncol(vals) == length(var_names)) {
       names(vals) <- var_names
     } else {
-      # More bands than expected — name sequentially
       names(vals) <- paste0(var_names[1], "_", seq_len(ncol(vals)))
     }
     message("  Extracted: ", paste(var_names, collapse = ", "))
     return(vals)
   }, error = function(e) {
     message("  ERROR extracting ", var_names[1], ": ", e$message)
-    # Return NA columns
-    df <- as.data.frame(matrix(NA, nrow = nrow(all_pts_sf),
-                               ncol = length(var_names)))
+    df <- as.data.frame(matrix(NA, nrow = nrow(all_pts_df), ncol = length(var_names)))
     names(df) <- var_names
     return(df)
   })
@@ -131,117 +84,59 @@ safe_extract <- function(raster_path, points_vect,
 
 
 # -------------------------------------------------------------
-# SECTION 4: Extract DEM
+# SECTION 4-10: Extract all raster layers (same variables as original)
 # -------------------------------------------------------------
 
 message("\nExtracting DEM...")
-
-ext_dem <- safe_extract(
-  paths$dem, all_vect, "elevation"
-)
-
-
-# -------------------------------------------------------------
-# SECTION 5: Extract Sentinel-2A Bands
-# -------------------------------------------------------------
+ext_dem <- safe_extract(paths$dem, all_vect, "elevation")
 
 message("\nExtracting Sentinel-2A bands...")
-
 s2_bands <- list(
-  list(path = paths$B01, name = "S2_B01"),
-  list(path = paths$B02, name = "S2_B02"),
-  list(path = paths$B03, name = "S2_B03"),
-  list(path = paths$B04, name = "S2_B04"),
-  list(path = paths$B05, name = "S2_B05"),
-  list(path = paths$B06, name = "S2_B06"),
-  list(path = paths$B07, name = "S2_B07"),
-  list(path = paths$B08, name = "S2_B08"),
-  list(path = paths$B09, name = "S2_B09"),
-  list(path = paths$B11, name = "S2_B11"),
-  list(path = paths$B12, name = "S2_B12"),
-  list(path = paths$B8A, name = "S2_B8A")
+  list(path = paths$B01, name = "S2_B01"), list(path = paths$B02, name = "S2_B02"),
+  list(path = paths$B03, name = "S2_B03"), list(path = paths$B04, name = "S2_B04"),
+  list(path = paths$B05, name = "S2_B05"), list(path = paths$B06, name = "S2_B06"),
+  list(path = paths$B07, name = "S2_B07"), list(path = paths$B08, name = "S2_B08"),
+  list(path = paths$B09, name = "S2_B09"), list(path = paths$B11, name = "S2_B11"),
+  list(path = paths$B12, name = "S2_B12"), list(path = paths$B8A, name = "S2_B8A")
 )
-
-ext_s2_bands <- lapply(s2_bands, function(b) {
-  safe_extract(b$path, all_vect, b$name)
-})
-ext_s2_bands <- bind_cols(ext_s2_bands)
-
-
-# -------------------------------------------------------------
-# SECTION 6: Extract Sentinel-2A Derived Indices
-# -------------------------------------------------------------
+ext_s2_bands <- bind_cols(lapply(s2_bands, function(b) safe_extract(b$path, all_vect, b$name)))
 
 message("\nExtracting Sentinel-2A derived indices...")
-
 s2_indices <- list(
-  list(path = paths$NDVI,  name = "NDVI"),
-  list(path = paths$NDWI,  name = "NDWI"),
-  list(path = paths$MNDWI, name = "MNDWI"),
-  list(path = paths$NDBI,  name = "NDBI"),
-  list(path = paths$BSI,   name = "BSI"),
-  list(path = paths$SAVI,  name = "SAVI"),
+  list(path = paths$NDVI,  name = "NDVI"),  list(path = paths$NDWI,  name = "NDWI"),
+  list(path = paths$MNDWI, name = "MNDWI"), list(path = paths$NDBI,  name = "NDBI"),
+  list(path = paths$BSI,   name = "BSI"),   list(path = paths$SAVI,  name = "SAVI"),
   list(path = paths$MSAVI, name = "MSAVI")
 )
-
-ext_indices <- lapply(s2_indices, function(idx) {
-  safe_extract(idx$path, all_vect, idx$name)
-})
-ext_indices <- bind_cols(ext_indices)
-
-
-# -------------------------------------------------------------
-# SECTION 7: Extract Soil Properties
-# -------------------------------------------------------------
+ext_indices <- bind_cols(lapply(s2_indices, function(idx) safe_extract(idx$path, all_vect, idx$name)))
 
 message("\nExtracting soil properties...")
-
 soil_layers <- list(
-  list(path = paths$soil_depth,       name = "soil_depth"),
-  list(path = paths$soil_erosion,     name = "soil_erosion"),
-  list(path = paths$soil_productivity,name = "soil_productivity"),
-  list(path = paths$soil_slope,       name = "soil_slope"),
-  list(path = paths$soil_texture,     name = "soil_texture")
+  list(path = paths$soil_depth,        name = "soil_depth"),
+  list(path = paths$soil_erosion,      name = "soil_erosion"),
+  list(path = paths$soil_productivity, name = "soil_productivity"),
+  list(path = paths$soil_slope,        name = "soil_slope"),
+  list(path = paths$soil_texture,      name = "soil_texture")
 )
-
-ext_soil <- lapply(soil_layers, function(s) {
-  safe_extract(s$path, all_vect, s$name)
-})
-ext_soil <- bind_cols(ext_soil)
-
-
-# -------------------------------------------------------------
-# SECTION 8: Extract CHELSA Modern Climate
-# -------------------------------------------------------------
+ext_soil <- bind_cols(lapply(soil_layers, function(s) safe_extract(s$path, all_vect, s$name)))
 
 message("\nExtracting CHELSA modern climate...")
-
 ext_chelsa_modern <- bind_cols(
   safe_extract(paths$chelsa_bio01_modern, all_vect, "chelsa_bio01_modern"),
   safe_extract(paths$chelsa_bio12_modern, all_vect, "chelsa_bio12_modern"),
   safe_extract(paths$chelsa_bio15_modern, all_vect, "chelsa_bio15_modern")
 )
 
-
-# -------------------------------------------------------------
-# SECTION 9: Extract CHELSA TraCE21k Palaeoclimate (~20ka LGM)
-# -------------------------------------------------------------
-
 message("\nExtracting CHELSA TraCE21k palaeoclimate (LGM ~20ka)...")
-
+message("  NOTE: extracted at ALL points/periods here. Temporal-validity")
+message("  restriction for LP/MP applied later in Script 06, not here.")
 ext_chelsa_lgm <- bind_cols(
   safe_extract(paths$chelsa_bio01_lgm, all_vect, "chelsa_bio01_lgm"),
   safe_extract(paths$chelsa_bio12_lgm, all_vect, "chelsa_bio12_lgm"),
   safe_extract(paths$chelsa_bio15_lgm, all_vect, "chelsa_bio15_lgm")
 )
 
-
-# -------------------------------------------------------------
-# SECTION 10: Extract WorldClim 2.1
-# -------------------------------------------------------------
-
 message("\nExtracting WorldClim 2.1...")
-
 ext_worldclim <- bind_cols(
   safe_extract(paths$wc_bio01, all_vect, "wc_bio01"),
   safe_extract(paths$wc_bio12, all_vect, "wc_bio12"),
@@ -250,124 +145,129 @@ ext_worldclim <- bind_cols(
 
 
 # -------------------------------------------------------------
-# SECTION 11: Assemble Master Extraction Matrix
+# SECTION 11: Assemble Master Matrix — metadata RETAINED
 # -------------------------------------------------------------
 
 message("\nAssembling master extraction matrix...")
 
 master_matrix <- bind_cols(
-  all_pts_sf,         # point_id, point_type, period, easting, northing
-  ext_dem,            # elevation
-  ext_s2_bands,       # S2_B01 to S2_B8A (12 bands)
-  ext_indices,        # NDVI, NDWI, MNDWI, NDBI, BSI, SAVI, MSAVI
-  ext_soil,           # soil_depth, erosion, productivity, slope, texture
-  ext_chelsa_modern,  # chelsa_bio01/12/15_modern
-  ext_chelsa_lgm,     # chelsa_bio01/12/15_lgm
-  ext_worldclim       # wc_bio01/12/15
+  all_pts_df,          # point_id, point_type, period, coord_precision, easting, northing, bg_source
+  ext_dem, ext_s2_bands, ext_indices, ext_soil,
+  ext_chelsa_modern, ext_chelsa_lgm, ext_worldclim
 )
 
-message("Master matrix dimensions: ",
-        nrow(master_matrix), " rows × ", ncol(master_matrix), " columns")
-message("Columns: ", paste(names(master_matrix), collapse = ", "))
+message("Master matrix (pre-coercion): ", nrow(master_matrix), " rows x ",
+        ncol(master_matrix), " cols")
 
 
 # -------------------------------------------------------------
-# SECTION 12: Check for Missing Values
+# SECTION 12: NUMERIC COERCION AUDIT  [NEW — fixes reported bug]
 # -------------------------------------------------------------
 
-message("\nChecking for missing values...")
+extracted_var_names <- c(
+  "elevation",
+  sapply(s2_bands, `[[`, "name"),
+  sapply(s2_indices, `[[`, "name"),
+  sapply(soil_layers, `[[`, "name"),
+  "chelsa_bio01_modern","chelsa_bio12_modern","chelsa_bio15_modern",
+  "chelsa_bio01_lgm","chelsa_bio12_lgm","chelsa_bio15_lgm",
+  "wc_bio01","wc_bio12","wc_bio15"
+)
 
-# Count NAs per column
+message("\n=== NUMERIC COERCION AUDIT ===")
+message("Checking ", length(extracted_var_names), " extracted variables for type issues...")
+
+coercion_report <- tibble(variable = character(), class_before = character(),
+                          na_before = integer(), na_after = integer(),
+                          new_na_from_coercion = integer())
+
+for (v in extracted_var_names) {
+  col_before   <- master_matrix[[v]]
+  class_before <- class(col_before)[1]
+  na_before    <- sum(is.na(col_before))
+  
+  col_after <- suppressWarnings(as.numeric(col_before))
+  na_after  <- sum(is.na(col_after))
+  new_na    <- na_after - na_before
+  
+  master_matrix[[v]] <- col_after
+  
+  coercion_report <- bind_rows(coercion_report, tibble(
+    variable = v, class_before = class_before,
+    na_before = na_before, na_after = na_after,
+    new_na_from_coercion = new_na
+  ))
+  
+  if (class_before != "numeric" || new_na > 0) {
+    message("  FLAG: ", v, " | was ", class_before,
+            " | NA before=", na_before, " -> after=", na_after,
+            " | coercion introduced ", new_na, " new NA(s)")
+    if (new_na > 0) {
+      bad_vals <- col_before[is.na(col_after) & !is.na(col_before)]
+      message("    Sample non-numeric values found: ",
+              paste(head(unique(bad_vals), 5), collapse = " | "))
+    }
+  }
+}
+
+n_flagged <- sum(coercion_report$class_before != "numeric" |
+                   coercion_report$new_na_from_coercion > 0)
+message("\nVariables with type/coercion issues: ", n_flagged, " of ", length(extracted_var_names))
+
+write_csv(coercion_report,
+          file.path(chapter_root, "11_Tables", "Table_QC_numeric_coercion_audit.csv"))
+message("Saved: Table_QC_numeric_coercion_audit.csv [NEW — check this before trusting master_matrix]")
+
+if (n_flagged > 0) {
+  message("\n*** DO NOT PROCEED to Script 04 until you've inspected the flagged")
+  message("*** variables above. If new_na_from_coercion > 0 for background rows")
+  message("*** specifically, the root cause is contamination in the raw raster")
+  message("*** or extraction (e.g. locale decimal-comma, out-of-extent string,")
+  message("*** factor-coded raster) — not just a downstream typing quirk.")
+}
+
+
+# -------------------------------------------------------------
+# SECTION 13: Missing Value Summary (post-coercion)
+# -------------------------------------------------------------
+
 na_summary <- master_matrix %>%
-  summarise(across(everything(), ~sum(is.na(.)))) %>%
-  pivot_longer(everything(),
-               names_to  = "variable",
-               values_to = "n_missing") %>%
+  summarise(across(all_of(extracted_var_names), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
   filter(n_missing > 0) %>%
   arrange(desc(n_missing))
 
 if (nrow(na_summary) == 0) {
-  message("No missing values detected.")
+  message("\nNo missing values detected post-coercion.")
 } else {
-  message("Variables with missing values:")
+  message("\nVariables with missing values (post-coercion):")
   print(na_summary)
-  message("\nTotal rows with any NA: ",
-          sum(!complete.cases(master_matrix)))
 }
 
-# Split into site and background for inspection
-sites_matrix    <- master_matrix %>% filter(point_type == "site")
-bg_matrix       <- master_matrix %>% filter(point_type == "background")
+sites_matrix <- master_matrix %>% filter(point_type == "site")
+bg_matrix    <- master_matrix %>% filter(point_type == "background")
 
-message("\nSite rows: ",       nrow(sites_matrix))
-message("Background rows: ",  nrow(bg_matrix))
-message("Complete site rows: ", sum(complete.cases(sites_matrix)))
-
-
-# -------------------------------------------------------------
-# SECTION 13: Basic Descriptive Statistics
-# -------------------------------------------------------------
-
-message("\nDescriptive statistics for key variables at site locations:")
-
-site_stats <- sites_matrix %>%
-  select(period, elevation, NDVI, NDWI, MNDWI, BSI,
-         soil_depth, soil_productivity,
-         chelsa_bio01_lgm, chelsa_bio12_lgm) %>%
-  group_by(period) %>%
-  summarise(across(where(is.numeric),
-                   list(mean = ~round(mean(., na.rm = TRUE), 3),
-                        sd   = ~round(sd(., na.rm = TRUE), 3)),
-                   .names = "{.col}_{.fn}"),
-            .groups = "drop")
-
-print(site_stats)
+message("\nSite rows: ", nrow(sites_matrix), " | Background rows: ", nrow(bg_matrix))
+message("Complete site rows: ", sum(complete.cases(sites_matrix %>% select(all_of(extracted_var_names)))))
 
 
 # -------------------------------------------------------------
 # SECTION 14: Save Outputs
 # -------------------------------------------------------------
 
-message("\nSaving outputs...")
-
 out_path <- file.path(chapter_root, "03_Extracted_Values")
 
-# 1. Full master matrix
-write_csv(
-  master_matrix,
-  file.path(out_path, "master_extraction_matrix.csv")
-)
-message("Saved: master_extraction_matrix.csv")
+write_csv(master_matrix, file.path(out_path, "master_extraction_matrix.csv"))
+write_csv(sites_matrix,  file.path(out_path, "sites_extraction_matrix.csv"))
+write_csv(bg_matrix,     file.path(out_path, "background_extraction_matrix.csv"))
+message("\nSaved: master/sites/background_extraction_matrix.csv (all now carry")
+message("coord_precision + period[LP/MP/UP/MULTI] + bg_source, all-numeric verified)")
 
-# 2. Sites only
-write_csv(
-  sites_matrix,
-  file.path(out_path, "sites_extraction_matrix.csv")
-)
-message("Saved: sites_extraction_matrix.csv")
-
-# 3. Background only
-write_csv(
-  bg_matrix,
-  file.path(out_path, "background_extraction_matrix.csv")
-)
-message("Saved: background_extraction_matrix.csv")
-
-# 4. RData — primary input for all downstream scripts
-save(
-  master_matrix,
-  sites_matrix,
-  bg_matrix,
-  file = file.path(out_path, "master_extraction_matrix.RData")
-)
+save(master_matrix, sites_matrix, bg_matrix, extracted_var_names, coercion_report,
+     file = file.path(out_path, "master_extraction_matrix.RData"))
 message("Saved: master_extraction_matrix.RData")
 
-# 5. NA summary table
-write_csv(
-  na_summary,
-  file.path(chapter_root, "11_Tables",
-            "Table_QC_missing_values.csv")
-)
+write_csv(na_summary, file.path(chapter_root, "11_Tables", "Table_QC_missing_values.csv"))
 message("Saved: Table_QC_missing_values.csv")
 
 
@@ -375,19 +275,17 @@ message("Saved: Table_QC_missing_values.csv")
 # SECTION 15: Log Session
 # -------------------------------------------------------------
 
-log_file <- file.path(chapter_root, "13_Logs",
-                      paste0("script03_log_", Sys.Date(), ".txt"))
+log_file <- file.path(chapter_root, "13_Logs", paste0("script03_log_", Sys.Date(), ".txt"))
 sink(log_file)
-cat("SCRIPT 03 LOG — Raster Variable Extraction\n")
+cat("SCRIPT 03 LOG (REBUILT) — Raster Variable Extraction\n")
 cat("Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
-cat("Total points: ", nrow(master_matrix), "\n")
-cat("Sites: ",        nrow(sites_matrix), "\n")
-cat("Background: ",   nrow(bg_matrix), "\n")
-cat("Variables extracted: ", ncol(master_matrix), "\n\n")
-cat("Variables with missing values:\n")
+cat("Total points:", nrow(master_matrix), " (site=", nrow(sites_matrix),
+    ", background=", nrow(bg_matrix), ")\n\n")
+cat("Numeric coercion audit — flagged variables:\n")
+print(coercion_report %>% filter(class_before != "numeric" | new_na_from_coercion > 0))
+cat("\nMissing values post-coercion:\n")
 print(na_summary)
 sink()
-
 message("Log saved: ", log_file)
 
 
@@ -396,10 +294,11 @@ message("Log saved: ", log_file)
 # -------------------------------------------------------------
 
 message("\n=============================================================")
-message("Script 03 complete.")
-message("Master matrix: ", nrow(master_matrix), " rows × ",
-        ncol(master_matrix), " columns")
-message("Outputs saved to: ", out_path)
-message("Next: Run Script 04 — Vector Variable Extraction")
-message("  (Structural geology proximity + geochemistry joins)")
+message("Script 03 (REBUILT) complete. PRIMARY (uniform bg) extraction done.")
+message("Master matrix: ", nrow(master_matrix), " rows x ", ncol(master_matrix), " cols")
+message("Numeric coercion audit: ", n_flagged, " variable(s) flagged — see")
+message("Table_QC_numeric_coercion_audit.csv. RESOLVE before Script 04 if >0.")
+message("Envelope-background extraction deferred to Script 06/07 sensitivity pass.")
+message("Next: Script 04 — Vector Variable Extraction")
+message("  (structural geology — unchanged; geochemistry — CLR+PCA reduction)")
 message("=============================================================")
